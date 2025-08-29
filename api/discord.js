@@ -1,384 +1,411 @@
-// api/discord.js — Pro version (HEAD + await verifyKey + deferred + extras)
-// Features:
-// - /cteam caps/multi/title/defaults（預設 12,12,12；先回 type 5 再發公開訊息）
-// - Buttons: join_N / leave_N + view_all（ephemeral）
-// - 名單顯示暱稱/名稱並排序（需 BOT_TOKEN；抓不到就顯示 <@id> 不會 @）
-// - 內容內嵌狀態：<!-- multi:... -->、<!-- members:{...} -->、<!-- title:... -->、<!-- msg:ID -->
-// - 基礎防衝突：PATCH 前（若有 BOT_TOKEN）會抓最新訊息內容，失敗短暫重試
-// - /myteams [message_id]（需 BOT_TOKEN）/ leaveall（安全指引）
-
+// api/discord.js — Slash 全改用方案 A（defer → PATCH @original）
+// - /cteam   : 公開 → defer → PATCH @original 放主訊息＋按鈕
+// - /myteams : ephemeral → defer(flags:64) → PATCH @original 回查詢結果
+// - /leaveall: ephemeral → defer(flags:64) → PATCH @original 回操作指引
+// - 按鈕：join/leave → type:6(DEFERRED_UPDATE_MESSAGE) → PATCH @original
+//        view_all → 直接回 ephemeral 總覽
 import {
   InteractionType,
   InteractionResponseType,
   verifyKey,
-} from 'discord-interactions';
+} from "discord-interactions";
 
-// ---------- utils ----------
+export const config = { runtime: "nodejs18.x" };
+
+/* -------------------- utils -------------------- */
 async function readRawBody(req) {
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  return Buffer.concat(chunks).toString('utf8');
+  const buf = [];
+  for await (const c of req) buf.push(c);
+  return Buffer.concat(buf).toString("utf8");
 }
+const HAN = [
+  "零","一","二","三","四","五","六","七","八","九","十",
+  "十一","十二","十三","十四","十五","十六","十七","十八","十九","二十"
+];
+const han = (n) => HAN[n] ?? String(n);
 
-const HAN = ['零','一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六','十七','十八','十九','二十'];
-const toHan = (n) => HAN[n] ?? String(n);
+const buildContentFromCaps = (caps) =>
+  caps.map((n, i) => `第${han(i + 1)}團（-${n}）`).join("\n\n");
 
-// content helpers
-function parseCaps(content) {
-  const lines = content.split('\n').map(s => s.trim()).filter(Boolean);
-  const caps = [];
-  for (const s of lines) {
-    const m = s.match(/（-(\d+)）$/);
-    if (m) caps.push(parseInt(m[1], 10));
-  }
-  return caps;
-}
-function buildContentFromCaps(caps) {
-  return caps.map((n, i) => `第${toHan(i + 1)}團（-${n}）`).join('\n\n');
-}
 function buildComponents(caps) {
   const rows = caps.map((_, i) => ({
     type: 1,
     components: [
-      { type: 2, style: 3, custom_id: `join_${i+1}`,  label: `加入第${toHan(i+1)}團` },
-      { type: 2, style: 2, custom_id: `leave_${i+1}`, label: `離開第${toHan(i+1)}團` },
+      { type: 2, style: 3, custom_id: `join_${i + 1}`,  label: `加入第${han(i + 1)}團` },
+      { type: 2, style: 2, custom_id: `leave_${i + 1}`, label: `離開第${han(i + 1)}團` },
     ],
   }));
-  if (rows.length === 0) rows.push({ type: 1, components: [] });
-  rows[rows.length - 1].components.push({ type: 2, style: 1, custom_id: 'view_all', label: '查看所有名單' });
+  if (!rows.length) rows.push({ type: 1, components: [] });
+  rows[rows.length - 1].components.push({
+    type: 2, style: 1, custom_id: "view_all", label: "查看所有名單",
+  });
   return rows;
 }
 
-// embed state
-function getMulti(s) {
-  const m = s.match(/<!--\s*multi:(true|false)\s*-->/i);
-  return m ? m[1] === 'true' : false;
+// 解析 caps 輸入
+const parseCapsInput = (v) =>
+  String(v)
+    .split(",")
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => Number.isInteger(n) && n >= 0);
+
+// 從內容解析目前各團剩餘名額
+function parseCapsFromContent(content) {
+  return content
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const a = line.lastIndexOf("（-");
+      const b = line.lastIndexOf("）");
+      if (a !== -1 && b !== -1 && b > a + 2) {
+        const n = parseInt(line.slice(a + 2, b), 10);
+        if (Number.isInteger(n)) return n;
+      }
+      return null;
+    })
+    .filter((n) => n !== null);
 }
-function setMulti(s, multi) {
-  const cleaned = s.replace(/<!--\s*multi:(true|false)\s*-->/i, '').trim();
-  return `${cleaned}\n\n<!-- multi:${multi ? 'true' : 'false'} -->`;
+
+/* ---- 將狀態存到 content 註解區（不碰元件，便於 stateless） ---- */
+function getBetween(s, start, stop) {
+  const a = s.indexOf(start);
+  if (a === -1) return null;
+  const b = s.indexOf(stop, a + start.length);
+  if (b === -1) return null;
+  return s.slice(a + start.length, b);
 }
-function getMembers(s, groupCount) {
-  const m = s.match(/<!--\s*members:\s*({[\s\S]*?})\s*-->/i);
-  if (!m) return Object.fromEntries(Array.from({length: groupCount}, (_, i) => [String(i+1), []]));
+function removeBlock(s, start, stop) {
+  const a = s.indexOf(start);
+  if (a === -1) return s;
+  const b = s.indexOf(stop, a + start.length);
+  if (b === -1) return s.slice(0, a).trim();
+  return (s.slice(0, a) + s.slice(b + stop.length)).trim();
+}
+
+function getMulti(content) {
+  const v = (getBetween(content, "<!-- multi:", " -->") || "").trim();
+  return v === "true";
+}
+function setMulti(content, multi) {
+  const w = removeBlock(content, "<!-- multi:", " -->");
+  return `${w}\n\n<!-- multi:${multi ? "true" : "false"} -->`;
+}
+function getMembers(content, count) {
   try {
-    const obj = JSON.parse(m[1]);
-    for (let i = 1; i <= groupCount; i++) if (!obj[String(i)]) obj[String(i)] = [];
+    const json = getBetween(content, "<!-- members:", " -->");
+    if (!json)
+      return Object.fromEntries(
+        Array.from({ length: count }, (_, i) => [String(i + 1), []])
+      );
+    const obj = JSON.parse(json);
+    for (let i = 1; i <= count; i++) if (!obj[String(i)]) obj[String(i)] = [];
     return obj;
   } catch {
-    return Object.fromEntries(Array.from({length: groupCount}, (_, i) => [String(i+1), []]));
+    return Object.fromEntries(
+      Array.from({ length: count }, (_, i) => [String(i + 1), []])
+    );
   }
 }
-function setMembers(s, membersObj) {
-  const without = s.replace(/<!--\s*members:\s*({[\s\S]*?})\s*-->/i, '').trim();
-  return `${without}\n<!-- members: ${JSON.stringify(membersObj)} -->`;
+function setMembers(content, obj) {
+  const w = removeBlock(content, "<!-- members:", " -->");
+  return `${w}\n<!-- members: ${JSON.stringify(obj)} -->`;
 }
-function getTitle(s) {
-  const m = s.match(/<!--\s*title:\s*([\s\S]*?)\s*-->/i);
-  return m ? m[1].trim() : '';
+function getTitle(content) {
+  return (getBetween(content, "<!-- title:", " -->") || "").trim();
 }
-function setTitle(s, title) {
-  const without = s.replace(/<!--\s*title:\s*([\s\S]*?)\s*-->/i, '').trim();
-  const t = (title || '').trim();
-  return t ? `${without}\n<!-- title: ${t} -->` : without;
-}
-function getMsgId(s) {
-  const m = s.match(/<!--\s*msg:\s*(\d+)\s*-->/i);
-  return m ? m[1] : '';
-}
-function setMsgId(s, msgId) {
-  const without = s.replace(/<!--\s*msg:\s*(\d+)\s*-->/i, '').trim();
-  return `${without}\n<!-- msg: ${msgId} -->`;
+function setTitle(content, title) {
+  const w = removeBlock(content, "<!-- title:", " -->");
+  return title ? `${w}\n<!-- title: ${title} -->` : w;
 }
 
-// defaults parser: "1: <@id> <@id>\n2: <@id>"
-function parseDefaults(text, groups) {
-  if (!text) return {};
-  const out = {};
-  const lines = String(text).split('\n');
-  for (const line of lines) {
-    const m = line.match(/^\s*(\d+)\s*:\s*(.*)$/);
-    if (!m) continue;
-    const idx = parseInt(m[1], 10);
-    if (idx < 1 || idx > groups) continue;
-    const ids = Array.from(m[2].matchAll(/<@!?(\d+)>/g)).map(mm => mm[1]);
-    out[String(idx)] = Array.from(new Set(ids));
-  }
-  return out;
-}
-
-// label helpers
+/* ---- 取暱稱／名稱用（需 BOT_TOKEN） ---- */
 async function fetchMemberLabel(guildId, userId) {
   const token = process.env.BOT_TOKEN;
   if (!token || !guildId) return null;
   try {
-    const r = await fetch(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}`, {
-      headers: { 'Authorization': `Bot ${token}` }
-    });
+    const r = await fetch(
+      `https://discord.com/api/v10/guilds/${guildId}/members/${userId}`,
+      { headers: { Authorization: `Bot ${token}` } }
+    );
     if (!r.ok) return null;
     const m = await r.json();
     const base = m?.user?.global_name || m?.user?.username || `User ${userId}`;
-    const nick = (m?.nick || '').trim();
+    const nick = (m?.nick || "").trim();
     return nick ? `${base} (${nick})` : base;
   } catch {
     return null;
   }
 }
 async function buildSortedLabelList(guildId, ids) {
-  const labels = await Promise.all(ids.map(id => fetchMemberLabel(guildId, id)));
-  const filled = labels.map((label, i) => label || `<@${ids[i]}>`);
-  const collator = new Intl.Collator('zh-Hant', { sensitivity: 'base', numeric: true });
-  return filled.sort((a, b) => collator.compare(a, b));
+  const labels = await Promise.all(ids.map((id) => fetchMemberLabel(guildId, id)));
+  const list = labels.map((l, i) => l || `<@${ids[i]}>`);
+  const collator = new Intl.Collator("zh-Hant", { sensitivity: "base", numeric: true });
+  return list.sort((a, b) => collator.compare(a, b));
 }
 
-// helpers for REST
-async function fetchMessage(channelId, messageId) {
-  const token = process.env.BOT_TOKEN;
-  if (!token) return null;
-  const r = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
-    headers: { 'Authorization': `Bot ${token}` }
-  });
-  if (!r.ok) return null;
-  return await r.json();
+/* ---- Webhook helpers ---- */
+async function patchOriginal(appId, token, body) {
+  await fetch(
+    `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`,
+    { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+  );
 }
-async function patchMessageWithWebhook(appId, token, messageId, body) {
-  const r = await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}/messages/${messageId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+async function followup(appId, token, body) {
+  await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
-  return r.ok;
 }
 
-// ---------- main handler ----------
+/* -------------------- handler -------------------- */
 export default async function handler(req, res) {
-  if (req.method === 'HEAD') { res.status(200).end(); return; }
-  if (req.method !== 'POST') { res.status(405).send('Method Not Allowed'); return; }
+  if (req.method === "HEAD") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const sig = req.headers['x-signature-ed25519'];
-  const ts  = req.headers['x-signature-timestamp'];
+  const signature = req.headers["x-signature-ed25519"];
+  const timestamp = req.headers["x-signature-timestamp"];
   const raw = await readRawBody(req);
 
-  const ok = await verifyKey(raw, sig, ts, process.env.PUBLIC_KEY);
-  if (!ok) { res.status(401).send('invalid request signature'); return; }
+  const valid = verifyKey(raw, signature, timestamp, process.env.PUBLIC_KEY);
+  if (!valid) return res.status(401).send("invalid request signature");
 
   const i = JSON.parse(raw);
 
   // PING
-  if (i.type === InteractionType.PING) {
+  if (i.type === InteractionType.PING)
     return res.status(200).json({ type: InteractionResponseType.PONG });
-  }
 
-  // Slash commands
+  /* ---------- Slash commands (方案A) ---------- */
   if (i.type === InteractionType.APPLICATION_COMMAND) {
     const name = i.data?.name;
 
-    // ---------- /cteam ----------
-    if (name === 'cteam') {
-      // Immediately defer (type 5)
-      res.status(200).json({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+    // /cteam → 公開：defer → PATCH @original
+    if (name === "cteam") {
+      res
+        .status(200)
+        .json({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
 
-      const capsRaw    = i.data.options?.find(o => o.name === 'caps')?.value ?? '12,12,12';
-      const allowMulti = i.data.options?.find(o => o.name === 'multi')?.value ?? false;
-      const title      = (i.data.options?.find(o => o.name === 'title')?.value ?? '').trim();
-      const defaultsTx = (i.data.options?.find(o => o.name === 'defaults')?.value ?? '').trim();
+      try {
+        const capsRaw =
+          i.data.options?.find((o) => o.name === "caps")?.value ?? "12,12,12";
+        const allowMulti =
+          i.data.options?.find((o) => o.name === "multi")?.value ?? false;
+        const title =
+          (i.data.options?.find((o) => o.name === "title")?.value ?? "").trim();
 
-      const caps = String(capsRaw).split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n >= 0);
-      if (!caps.length || caps.length * 2 > 25) {
-        await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: '名額格式錯誤或團數過多（最多 12 團）。', flags: 64 })
-        });
-        return;
-      }
-
-      // Build initial state
-      let content = buildContentFromCaps(caps);
-      if (title) content = `${title}\n\n${content}`;
-      content = setMulti(content, !!allowMulti);
-
-      // members with defaults
-      let members = Object.fromEntries(caps.map((_, idx) => [String(idx+1), []]));
-      const preset = parseDefaults(defaultsTx, caps.length);
-      for (const k of Object.keys(preset)) {
-        const idx = parseInt(k, 10);
-        const ids = preset[k];
-        for (const uid of ids) {
-          if (!members[k].includes(uid)) {
-            members[k].push(uid);
-            if (caps[idx-1] > 0) caps[idx-1] -= 1;
-          }
+        const caps = parseCapsInput(capsRaw);
+        if (!caps.length || caps.length * 2 > 25) {
+          await followup(i.application_id, i.token, {
+            content: "名額格式錯誤或團數過多（最多 12 團）。",
+            flags: 64,
+          });
+          return;
         }
-      }
-      content = setMembers(content, members);
-      content = setTitle(content, title);
 
-      // Post the message as follow-up (wait to get id)
-      const follow = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}?wait=true`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        let content = buildContentFromCaps(caps);
+        if (title) content = `${title}\n\n${content}`;
+        content = setMulti(content, !!allowMulti);
+        content = setMembers(
+          content,
+          Object.fromEntries(caps.map((_, idx) => [String(idx + 1), []]))
+        );
+        content = setTitle(content, title);
+
+        await patchOriginal(i.application_id, i.token, {
           content,
           components: buildComponents(caps),
-          allowed_mentions: { parse: [] }
-        })
-      }).then(r => r.json()).catch(() => null);
-
-      if (!follow?.id) return;
-
-      // Append msg id metadata
-      const withMsg = setMsgId(content, follow.id);
-      await patchMessageWithWebhook(i.application_id, i.token, follow.id, { content: withMsg });
+          allowed_mentions: { parse: [] },
+        });
+      } catch (e) {
+        console.error("cteam error", e);
+        await followup(i.application_id, i.token, {
+          content: "建立訊息時發生錯誤。",
+          flags: 64,
+        });
+      }
       return;
     }
 
-    // ---------- /myteams ----------
-    if (name === 'myteams') {
-      const targetId = (i.data.options?.find(o => o.name === 'message_id')?.value ?? '').trim();
-      if (!targetId) {
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '請提供 message_id（在訊息「更多」→ 複製連結），或直接在開團訊息下方點「查看所有名單」。', flags: 64 }
-        });
-      }
-      if (!process.env.BOT_TOKEN) {
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '系統未設定 BOT_TOKEN，無法讀取指定訊息。請改用「查看所有名單」按鈕。', flags: 64 }
-        });
-      }
-      const msg = await fetchMessage(i.channel_id, targetId);
-      if (!msg) {
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '找不到該訊息，或我沒有權限讀取。', flags: 64 }
-        });
-      }
-      const capsNow = parseCaps(msg.content);
-      const members = getMembers(msg.content, capsNow.length);
-      const uid = i.member?.user?.id || i.user?.id;
-      const my = Object.entries(members).filter(([, arr]) => arr.includes(uid)).map(([k]) => parseInt(k, 10));
-      const reply = my.length ? `你目前在第 ${my.join(', ')} 團。` : '你目前未加入任何一團。';
-      return res.status(200).json({
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: reply, flags: 64 }
+    // /myteams → ephemeral：defer(flags:64) → PATCH @original
+    if (name === "myteams") {
+      res.status(200).json({
+        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { flags: 64 },
       });
+
+      try {
+        const messageId =
+          (i.data.options?.find((o) => o.name === "message_id")?.value ?? "").trim();
+        if (!messageId) {
+          await patchOriginal(i.application_id, i.token, {
+            content: "請提供 message_id（訊息『更多』→ 複製連結）。",
+            flags: 64,
+          });
+          return;
+        }
+        if (!process.env.BOT_TOKEN) {
+          await patchOriginal(i.application_id, i.token, {
+            content: "未設定 BOT_TOKEN，無法讀取訊息。",
+            flags: 64,
+          });
+          return;
+        }
+        // 以當前頻道讀該訊息
+        const r = await fetch(
+          `https://discord.com/api/v10/channels/${i.channel_id}/messages/${messageId}`,
+          { headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` } }
+        );
+        if (!r.ok) {
+          await patchOriginal(i.application_id, i.token, {
+            content: "找不到該訊息或權限不足。",
+            flags: 64,
+          });
+          return;
+        }
+        const msg = await r.json();
+        const capsNow = parseCapsFromContent(msg.content);
+        const members = getMembers(msg.content, capsNow.length);
+        const uid = i.member?.user?.id || i.user?.id;
+        const mine = Object.entries(members)
+          .filter(([, arr]) => arr.includes(uid))
+          .map(([k]) => parseInt(k, 10));
+        const reply = mine.length
+          ? `你目前在第 ${mine.join(", ")} 團。`
+          : "你目前未加入任何一團。";
+        await patchOriginal(i.application_id, i.token, { content: reply, flags: 64 });
+      } catch (e) {
+        console.error("myteams error", e);
+        await patchOriginal(i.application_id, i.token, {
+          content: "查詢時發生錯誤。",
+          flags: 64,
+        });
+      }
+      return;
     }
 
-    // ---------- /leaveall ----------
-    if (name === 'leaveall') {
-      return res.status(200).json({
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: '請到開團訊息下方，對你所在的每團按下「離開」。這樣最安全、也能避免編輯衝突。', flags: 64 }
+    // /leaveall → ephemeral：defer(flags:64) → PATCH @original
+    if (name === "leaveall") {
+      res.status(200).json({
+        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { flags: 64 },
       });
+      try {
+        await patchOriginal(i.application_id, i.token, {
+          content:
+            "請到開團訊息下方，對你所在的每團按下「離開」。這樣最安全，也能避免跨訊息編輯衝突。",
+          flags: 64,
+        });
+      } catch (e) {
+        console.error("leaveall error", e);
+        await patchOriginal(i.application_id, i.token, {
+          content: "處理時發生錯誤。",
+          flags: 64,
+        });
+      }
+      return;
     }
   }
 
-  // Component interactions (buttons)
+  /* ---------- 按鈕互動 ---------- */
   if (i.type === InteractionType.MESSAGE_COMPONENT) {
     const customId = i.data?.custom_id;
-    const message  = i.message;
-    const userId   = i.member?.user?.id || i.user?.id;
-    const guildId  = i.guild_id;
+    const message = i.message;
+    const userId = i.member?.user?.id || i.user?.id;
 
-    if (customId === 'view_all') {
-      const capsNow = parseCaps(message.content);
+    // 查看所有名單 → 直接回 ephemeral
+    if (customId === "view_all") {
+      const capsNow = parseCapsFromContent(message.content);
       const members = getMembers(message.content, capsNow.length);
-      const parts = await Promise.all(capsNow.map(async (n, idx) => {
-        const ids = members[String(idx+1)] || [];
-        const title = `第${toHan(idx+1)}團名單（${ids.length} 人）`;
-        if (!ids.length || !guildId || !process.env.BOT_TOKEN) {
-          const list = ids.length ? ids.map(id => `<@${id}>`).join('、') : '（尚無成員）';
-          return `${title}\n${list}`;
-        }
-        const labels = await buildSortedLabelList(guildId, ids);
-        const list = labels.length ? labels.join('、') : '（尚無成員）';
-        return `${title}\n${list}`;
-      }));
+      const guildId = i.guild_id;
+
+      const parts = await Promise.all(
+        capsNow.map(async (_, idx) => {
+          const ids = members[String(idx + 1)] || [];
+          const header = `第${han(idx + 1)}團名單（${ids.length} 人）`;
+          if (!ids.length || !process.env.BOT_TOKEN || !guildId) {
+            const list = ids.length ? ids.map((id) => `<@${id}>`).join("、") : "（尚無成員）";
+            return `${header}\n${list}`;
+          }
+          const list = (await buildSortedLabelList(guildId, ids)).join("、") || "（尚無成員）";
+          return `${header}\n${list}`;
+        })
+      );
 
       return res.status(200).json({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: parts.join('\n\n'), flags: 64, allowed_mentions: { parse: [] } }
+        data: { content: parts.join("\n\n"), flags: 64, allowed_mentions: { parse: [] } },
       });
     }
 
-    // defer update
-    res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
-
-    // conflict mitigation: fetch latest message content with BOT_TOKEN if possible
-    let currentContent = message.content;
-    const msgId = getMsgId(message.content) || message.id;
-    if (process.env.BOT_TOKEN) {
-      const refreshed = await fetchMessage(i.channel_id, msgId);
-      if (refreshed?.content) currentContent = refreshed.content;
-    }
+    // 其他按鈕：先 defer update，再 PATCH 原訊息
+    res
+      .status(200)
+      .json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
 
     (async () => {
       try {
-        const capsNow = parseCaps(currentContent);
-        const groupCount = capsNow.length;
-        let multi   = getMulti(currentContent);
-        let members = getMembers(currentContent, groupCount);
-        const title = getTitle(currentContent);
+        const capsNow = parseCapsFromContent(message.content);
+        let multi = getMulti(message.content);
+        let members = getMembers(message.content, capsNow.length);
+        const title = getTitle(message.content);
 
         const m = customId.match(/^(join|leave)_(\d+)$/);
         if (!m) return;
         const action = m[1];
-        const idx    = parseInt(m[2], 10);
+        const idx = parseInt(m[2], 10);
 
-        const myGroups = Object.entries(members).filter(([, arr]) => Array.isArray(arr) && arr.includes(userId)).map(([k]) => parseInt(k, 10));
+        const ids = members[String(idx)] || (members[String(idx)] = []);
+        const inGroup = ids.includes(userId);
 
-        async function ephemeral(msg) {
-          await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: msg, flags: 64, allowed_mentions: { parse: [] } })
+        const ep = async (text) =>
+          followup(i.application_id, i.token, {
+            content: text,
+            flags: 64,
+            allowed_mentions: { parse: [] },
           });
+
+        if (action === "join") {
+          if (!multi) {
+            const has = Object.values(members).some((arr) => arr.includes(userId));
+            if (has) return ep("你已在其他團中。");
+          }
+          if (capsNow[idx - 1] <= 0) return ep("該團已滿。");
+          if (!inGroup) {
+            ids.push(userId);
+            capsNow[idx - 1] -= 1;
+          } else {
+            return ep("你已在該團。");
+          }
+        } else if (action === "leave") {
+          if (!inGroup) return ep("你不在該團。");
+          members[String(idx)] = ids.filter((x) => x !== userId);
+          capsNow[idx - 1] += 1;
         }
 
-        if (action === 'join') {
-          if (!multi && myGroups.length > 0) { await ephemeral(`你已在第 ${myGroups.join(', ')} 團。`); return; }
-          if (capsNow[idx - 1] <= 0) { await ephemeral('該團已滿，無法加入。'); return; }
-          const arr = members[String(idx)];
-          if (!arr.includes(userId)) { arr.push(userId); capsNow[idx - 1] -= 1; }
-          else { await ephemeral('你已在該團中。'); return; }
-        }
+        let content = buildContentFromCaps(capsNow);
+        if (title) content = `${title}\n\n${content}`;
+        content = setMulti(content, multi);
+        content = setMembers(content, members);
+        content = setTitle(content, title);
 
-        if (action === 'leave') {
-          const arr = members[String(idx)];
-          const pos = arr.indexOf(userId);
-          if (pos === -1) { await ephemeral('你不在該團中。'); return; }
-          arr.splice(pos, 1); capsNow[idx - 1] += 1;
-        }
-
-        let newContent = buildContentFromCaps(capsNow);
-        if (title) newContent = `${title}\n\n${newContent}`;
-        newContent = setMulti(newContent, multi);
-        newContent = setMembers(newContent, members);
-        newContent = setTitle(newContent, title);
-        newContent = setMsgId(newContent, msgId);
-
-        // retry a couple of times
-        let ok = false;
-        for (let attempt = 0; attempt < 3 && !ok; attempt++) {
-          ok = await patchMessageWithWebhook(i.application_id, i.token, msgId, {
-            content: newContent,
-            components: buildComponents(capsNow),
-            allowed_mentions: { parse: [] }
-          });
-          if (!ok) await new Promise(r => setTimeout(r, 120));
-        }
+        await patchOriginal(i.application_id, i.token, {
+          content,
+          components: buildComponents(capsNow),
+          allowed_mentions: { parse: [] },
+        });
       } catch (e) {
-        console.error('component error', e);
+        console.error("component error", e);
       }
     })();
 
     return;
   }
 
-  // Fallback
+  // fallback
   return res.status(200).json({
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-    data: { content: '未處理的互動類型。', flags: 64 }
+    data: { content: "未處理的互動類型。", flags: 64 },
   });
 }
