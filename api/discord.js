@@ -1,9 +1,7 @@
-// api/discord.js — Slash 全改用方案 A（defer → PATCH @original）
-// - /cteam   : 公開 → defer → PATCH @original 放主訊息＋按鈕
-// - /myteams : ephemeral → defer(flags:64) → PATCH @original 回查詢結果
-// - /leaveall: ephemeral → defer(flags:64) → PATCH @original 回操作指引
-// - 按鈕：join/leave → type:6(DEFERRED_UPDATE_MESSAGE) → PATCH @original
-//        view_all → 直接回 ephemeral 總覽
+// api/discord.js — 方案A：slash 一律 defer(type:5) → PATCH @original
+// 修正：按鈕最多 5 列（每列 ≤5 顆），12 團也能正常顯示。
+// view_all：回 ephemeral；join/leave：type:6 後 PATCH @original 更新訊息。
+
 import {
   InteractionType,
   InteractionResponseType,
@@ -12,49 +10,32 @@ import {
 
 export const config = { runtime: "nodejs18.x" };
 
-/* -------------------- utils -------------------- */
+/* ========== utils ========== */
 async function readRawBody(req) {
-  const buf = [];
-  for await (const c of req) buf.push(c);
-  return Buffer.concat(buf).toString("utf8");
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8");
 }
+
 const HAN = [
   "零","一","二","三","四","五","六","七","八","九","十",
   "十一","十二","十三","十四","十五","十六","十七","十八","十九","二十"
 ];
 const han = (n) => HAN[n] ?? String(n);
 
-const buildContentFromCaps = (caps) =>
-  caps.map((n, i) => `第${han(i + 1)}團（-${n}）`).join("\n\n");
-
-function buildComponents(caps) {
-  const rows = caps.map((_, i) => ({
-    type: 1,
-    components: [
-      { type: 2, style: 3, custom_id: `join_${i + 1}`,  label: `加入第${han(i + 1)}團` },
-      { type: 2, style: 2, custom_id: `leave_${i + 1}`, label: `離開第${han(i + 1)}團` },
-    ],
-  }));
-  if (!rows.length) rows.push({ type: 1, components: [] });
-  rows[rows.length - 1].components.push({
-    type: 2, style: 1, custom_id: "view_all", label: "查看所有名單",
-  });
-  return rows;
-}
-
-// 解析 caps 輸入
 const parseCapsInput = (v) =>
   String(v)
     .split(",")
     .map((s) => parseInt(s.trim(), 10))
     .filter((n) => Number.isInteger(n) && n >= 0);
 
-// 從內容解析目前各團剩餘名額
+const buildContentFromCaps = (caps) =>
+  caps.map((n, i) => `第${han(i + 1)}團（-${n}）`).join("\n\n");
+
+// 從內容還原各團剩餘名額
 function parseCapsFromContent(content) {
   return content
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean)
+    .split("\n").map((s) => s.trim()).filter(Boolean)
     .map((line) => {
       const a = line.lastIndexOf("（-");
       const b = line.lastIndexOf("）");
@@ -67,8 +48,24 @@ function parseCapsFromContent(content) {
     .filter((n) => n !== null);
 }
 
-/* ---- 將狀態存到 content 註解區（不碰元件，便於 stateless） ---- */
-function getBetween(s, start, stop) {
+// 5 顆一列、最多 5 列（25 顆上限）
+function buildComponentsPacked(caps) {
+  const buttons = [];
+  caps.forEach((_, i) => {
+    buttons.push({ type: 2, style: 3, custom_id: `join_${i + 1}`,  label: `加入第${han(i + 1)}團` });
+    buttons.push({ type: 2, style: 2, custom_id: `leave_${i + 1}`, label: `離開第${han(i + 1)}團` });
+  });
+  buttons.push({ type: 2, style: 1, custom_id: "view_all", label: "查看所有名單" });
+
+  const rows = [];
+  for (let i = 0; i < buttons.length && rows.length < 5; i += 5) {
+    rows.push({ type: 1, components: buttons.slice(i, i + 5) });
+  }
+  return rows;
+}
+
+/* ---- 將狀態持久化在 content 註解 ---- */
+function between(s, start, stop) {
   const a = s.indexOf(start);
   if (a === -1) return null;
   const b = s.indexOf(stop, a + start.length);
@@ -84,42 +81,35 @@ function removeBlock(s, start, stop) {
 }
 
 function getMulti(content) {
-  const v = (getBetween(content, "<!-- multi:", " -->") || "").trim();
-  return v === "true";
+  return (between(content, "<!-- multi:", " -->") || "").trim() === "true";
 }
 function setMulti(content, multi) {
-  const w = removeBlock(content, "<!-- multi:", " -->");
-  return `${w}\n\n<!-- multi:${multi ? "true" : "false"} -->`;
+  return `${removeBlock(content, "<!-- multi:", " -->")}\n\n<!-- multi:${multi ? "true" : "false"} -->`;
 }
 function getMembers(content, count) {
   try {
-    const json = getBetween(content, "<!-- members:", " -->");
+    const json = between(content, "<!-- members:", " -->");
     if (!json)
-      return Object.fromEntries(
-        Array.from({ length: count }, (_, i) => [String(i + 1), []])
-      );
+      return Object.fromEntries(Array.from({ length: count }, (_, i) => [String(i + 1), []]));
     const obj = JSON.parse(json);
     for (let i = 1; i <= count; i++) if (!obj[String(i)]) obj[String(i)] = [];
     return obj;
   } catch {
-    return Object.fromEntries(
-      Array.from({ length: count }, (_, i) => [String(i + 1), []])
-    );
+    return Object.fromEntries(Array.from({ length: count }, (_, i) => [String(i + 1), []]));
   }
 }
 function setMembers(content, obj) {
-  const w = removeBlock(content, "<!-- members:", " -->");
-  return `${w}\n<!-- members: ${JSON.stringify(obj)} -->`;
+  return `${removeBlock(content, "<!-- members:", " -->")}\n<!-- members: ${JSON.stringify(obj)} -->`;
 }
 function getTitle(content) {
-  return (getBetween(content, "<!-- title:", " -->") || "").trim();
+  return (between(content, "<!-- title:", " -->") || "").trim();
 }
 function setTitle(content, title) {
   const w = removeBlock(content, "<!-- title:", " -->");
   return title ? `${w}\n<!-- title: ${title} -->` : w;
 }
 
-/* ---- 取暱稱／名稱用（需 BOT_TOKEN） ---- */
+/* ---- labels（需 BOT_TOKEN，有就更漂亮，沒有也能跑） ---- */
 async function fetchMemberLabel(guildId, userId) {
   const token = process.env.BOT_TOKEN;
   if (!token || !guildId) return null;
@@ -144,12 +134,13 @@ async function buildSortedLabelList(guildId, ids) {
   return list.sort((a, b) => collator.compare(a, b));
 }
 
-/* ---- Webhook helpers ---- */
+/* ---- webhook helpers ---- */
 async function patchOriginal(appId, token, body) {
-  await fetch(
-    `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`,
-    { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-  );
+  await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 async function followup(appId, token, body) {
   await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
@@ -159,29 +150,30 @@ async function followup(appId, token, body) {
   });
 }
 
-/* -------------------- handler -------------------- */
+/* ========== handler ========== */
 export default async function handler(req, res) {
   if (req.method === "HEAD") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const signature = req.headers["x-signature-ed25519"];
-  const timestamp = req.headers["x-signature-timestamp"];
+  const sig = req.headers["x-signature-ed25519"];
+  const ts = req.headers["x-signature-timestamp"];
   const raw = await readRawBody(req);
 
-  const valid = verifyKey(raw, signature, timestamp, process.env.PUBLIC_KEY);
-  if (!valid) return res.status(401).send("invalid request signature");
+  const ok = verifyKey(raw, sig, ts, process.env.PUBLIC_KEY);
+  if (!ok) return res.status(401).send("invalid request signature");
 
   const i = JSON.parse(raw);
 
   // PING
-  if (i.type === InteractionType.PING)
+  if (i.type === InteractionType.PING) {
     return res.status(200).json({ type: InteractionResponseType.PONG });
+  }
 
-  /* ---------- Slash commands (方案A) ---------- */
+  /* ---- Slash commands（方案A） ---- */
   if (i.type === InteractionType.APPLICATION_COMMAND) {
     const name = i.data?.name;
 
-    // /cteam → 公開：defer → PATCH @original
+    // /cteam：公開 → defer → PATCH @original
     if (name === "cteam") {
       res
         .status(200)
@@ -196,9 +188,10 @@ export default async function handler(req, res) {
           (i.data.options?.find((o) => o.name === "title")?.value ?? "").trim();
 
         const caps = parseCapsInput(capsRaw);
-        if (!caps.length || caps.length * 2 > 25) {
+        // 上限：最多 12 團（2*N + 1 ≤ 25 顆按鈕）
+        if (!caps.length || caps.length > 12) {
           await followup(i.application_id, i.token, {
-            content: "名額格式錯誤或團數過多（最多 12 團）。",
+            content: "名額格式錯誤，或團數過多（最多 12 團）。",
             flags: 64,
           });
           return;
@@ -215,7 +208,7 @@ export default async function handler(req, res) {
 
         await patchOriginal(i.application_id, i.token, {
           content,
-          components: buildComponents(caps),
+          components: buildComponentsPacked(caps),
           allowed_mentions: { parse: [] },
         });
       } catch (e) {
@@ -228,7 +221,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // /myteams → ephemeral：defer(flags:64) → PATCH @original
+    // /myteams：ephemeral → defer(flags:64) → PATCH @original
     if (name === "myteams") {
       res.status(200).json({
         type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -238,9 +231,10 @@ export default async function handler(req, res) {
       try {
         const messageId =
           (i.data.options?.find((o) => o.name === "message_id")?.value ?? "").trim();
+
         if (!messageId) {
           await patchOriginal(i.application_id, i.token, {
-            content: "請提供 message_id（訊息『更多』→ 複製連結）。",
+            content: "請提供 message_id（訊息「更多」→ 複製連結）。",
             flags: 64,
           });
           return;
@@ -252,7 +246,7 @@ export default async function handler(req, res) {
           });
           return;
         }
-        // 以當前頻道讀該訊息
+
         const r = await fetch(
           `https://discord.com/api/v10/channels/${i.channel_id}/messages/${messageId}`,
           { headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` } }
@@ -268,13 +262,17 @@ export default async function handler(req, res) {
         const capsNow = parseCapsFromContent(msg.content);
         const members = getMembers(msg.content, capsNow.length);
         const uid = i.member?.user?.id || i.user?.id;
+
         const mine = Object.entries(members)
           .filter(([, arr]) => arr.includes(uid))
           .map(([k]) => parseInt(k, 10));
-        const reply = mine.length
-          ? `你目前在第 ${mine.join(", ")} 團。`
-          : "你目前未加入任何一團。";
-        await patchOriginal(i.application_id, i.token, { content: reply, flags: 64 });
+
+        await patchOriginal(i.application_id, i.token, {
+          content: mine.length
+            ? `你目前在第 ${mine.join(", ")} 團。`
+            : "你目前未加入任何一團。",
+          flags: 64,
+        });
       } catch (e) {
         console.error("myteams error", e);
         await patchOriginal(i.application_id, i.token, {
@@ -285,7 +283,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // /leaveall → ephemeral：defer(flags:64) → PATCH @original
+    // /leaveall：ephemeral → defer(flags:64) → PATCH @original
     if (name === "leaveall") {
       res.status(200).json({
         type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -308,16 +306,16 @@ export default async function handler(req, res) {
     }
   }
 
-  /* ---------- 按鈕互動 ---------- */
+  /* ---- 按鈕 ---- */
   if (i.type === InteractionType.MESSAGE_COMPONENT) {
     const customId = i.data?.custom_id;
-    const message = i.message;
+    const msg = i.message;
     const userId = i.member?.user?.id || i.user?.id;
 
-    // 查看所有名單 → 直接回 ephemeral
+    // 「查看所有名單」→ 直接回 ephemeral
     if (customId === "view_all") {
-      const capsNow = parseCapsFromContent(message.content);
-      const members = getMembers(message.content, capsNow.length);
+      const capsNow = parseCapsFromContent(msg.content);
+      const members = getMembers(msg.content, capsNow.length);
       const guildId = i.guild_id;
 
       const parts = await Promise.all(
@@ -339,32 +337,31 @@ export default async function handler(req, res) {
       });
     }
 
-    // 其他按鈕：先 defer update，再 PATCH 原訊息
-    res
-      .status(200)
-      .json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
+    // 其餘（join/leave）→ 先 defer update
+    res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
 
     (async () => {
       try {
-        const capsNow = parseCapsFromContent(message.content);
-        let multi = getMulti(message.content);
-        let members = getMembers(message.content, capsNow.length);
-        const title = getTitle(message.content);
+        const capsNow = parseCapsFromContent(msg.content);
+        let multi = getMulti(msg.content);
+        let members = getMembers(msg.content, capsNow.length);
+        const title = getTitle(msg.content);
 
         const m = customId.match(/^(join|leave)_(\d+)$/);
         if (!m) return;
         const action = m[1];
-        const idx = parseInt(m[2], 10);
+        const idx = parseInt(m[2], 10); // 1-based
 
         const ids = members[String(idx)] || (members[String(idx)] = []);
         const inGroup = ids.includes(userId);
 
-        const ep = async (text) =>
-          followup(i.application_id, i.token, {
+        async function ep(text) {
+          await followup(i.application_id, i.token, {
             content: text,
             flags: 64,
             allowed_mentions: { parse: [] },
           });
+        }
 
         if (action === "join") {
           if (!multi) {
@@ -392,7 +389,7 @@ export default async function handler(req, res) {
 
         await patchOriginal(i.application_id, i.token, {
           content,
-          components: buildComponents(capsNow),
+          components: buildComponentsPacked(capsNow),
           allowed_mentions: { parse: [] },
         });
       } catch (e) {
