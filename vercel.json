@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/discord.js": {
+      "memory": 128,
+      "maxDuration": 10
+    }
+  }
+}
