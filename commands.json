@@ -1,0 +1,26 @@
+[
+  {
+    "name": "cteam",
+    "description": "建立 N 團訊息（預設 12,12,12）",
+    "options": [
+      { "type": 3, "name": "caps", "description": "各團名額，如 12,12,12", "required": false },
+      { "type": 5, "name": "multi", "description": "允許同一人加入多團", "required": false },
+      { "type": 3, "name": "title", "description": "訊息標題", "required": false },
+      { "type": 3, "name": "defaults", "description": "預設名單，例如：1: <@ID> <@ID>\\n2: <@ID>", "required": false }
+    ]
+  },
+  {
+    "name": "myteams",
+    "description": "查詢我在指定開團訊息的所屬團",
+    "options": [
+      { "type": 3, "name": "message_id", "description": "目標訊息 ID", "required": false }
+    ]
+  },
+  {
+    "name": "leaveall",
+    "description": "安全離團指引（避免跨訊息編輯）",
+    "options": [
+      { "type": 3, "name": "message_id", "description": "目標訊息 ID", "required": false }
+    ]
+  }
+]
