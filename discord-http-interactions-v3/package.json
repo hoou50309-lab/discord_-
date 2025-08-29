@@ -1,9 +1,0 @@
-{
-  "name": "discord-http-interactions-v3",
-  "version": "3.0.0",
-  "type": "module",
-  "private": true,
-  "dependencies": {
-    "discord-interactions": "^4.0.0"
-  }
-}
