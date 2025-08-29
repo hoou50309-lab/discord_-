@@ -10,7 +10,7 @@ import {
   verifyKey,
 } from "discord-interactions";
 
-export const config = { runtime: "nodejs18.x" };
+export const config = { runtime: "nodejs" };
 
 // 版本戳，方便在訊息與日誌中辨識
 const VERSION =
