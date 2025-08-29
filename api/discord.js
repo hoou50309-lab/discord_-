@@ -287,8 +287,8 @@ export default async function handler(req, res) {
 
   // 1) PING
   if (interaction.type === InteractionType.PING) {
-    return res.status(200).json({ type: InteractionResponseType.PONG });
-  }
+  console.log('PING from application_id =', interaction.application_id);
+  return res.status(200).json({ type: InteractionResponseType.PONG });
 
   // 2) Slash 指令：/cteam /myteams /leaveall（皆用 type:5 先回覆）
   if (interaction.type === InteractionType.APPLICATION_COMMAND) {
