@@ -1,6 +1,7 @@
 // api/discord.js — 方案A：slash 一律 defer(type:5) → PATCH @original
 // 修正：按鈕最多 5 列（每列 ≤5 顆），12 團也能正常顯示。
-// view_all：回 ephemeral；join/leave：type:6 後 PATCH @original 更新訊息。
+// Logs：/cteam 入口 console.log('hit /cteam vA')
+//       PATCH 失敗 console.error('patch failed', status, text)
 
 import {
   InteractionType,
@@ -48,22 +49,6 @@ function parseCapsFromContent(content) {
     .filter((n) => n !== null);
 }
 
-// 5 顆一列、最多 5 列（25 顆上限）
-function buildComponentsPacked(caps) {
-  const buttons = [];
-  caps.forEach((_, i) => {
-    buttons.push({ type: 2, style: 3, custom_id: `join_${i + 1}`,  label: `加入第${han(i + 1)}團` });
-    buttons.push({ type: 2, style: 2, custom_id: `leave_${i + 1}`, label: `離開第${han(i + 1)}團` });
-  });
-  buttons.push({ type: 2, style: 1, custom_id: "view_all", label: "查看所有名單" });
-
-  const rows = [];
-  for (let i = 0; i < buttons.length && rows.length < 5; i += 5) {
-    rows.push({ type: 1, components: buttons.slice(i, i + 5) });
-  }
-  return rows;
-}
-
 /* ---- 將狀態持久化在 content 註解 ---- */
 function between(s, start, stop) {
   const a = s.indexOf(start);
@@ -109,6 +94,22 @@ function setTitle(content, title) {
   return title ? `${w}\n<!-- title: ${title} -->` : w;
 }
 
+/* ---- 5 列封頂的按鈕排版（2*N + 1 ≤ 25） ---- */
+function buildComponentsPacked(caps) {
+  const buttons = [];
+  caps.forEach((_, i) => {
+    buttons.push({ type: 2, style: 3, custom_id: `join_${i + 1}`,  label: `加入第${han(i + 1)}團` });
+    buttons.push({ type: 2, style: 2, custom_id: `leave_${i + 1}`, label: `離開第${han(i + 1)}團` });
+  });
+  buttons.push({ type: 2, style: 1, custom_id: "view_all", label: "查看所有名單" });
+
+  const rows = [];
+  for (let i = 0; i < buttons.length && rows.length < 5; i += 5) {
+    rows.push({ type: 1, components: buttons.slice(i, i + 5) });
+  }
+  return rows;
+}
+
 /* ---- labels（需 BOT_TOKEN，有就更漂亮，沒有也能跑） ---- */
 async function fetchMemberLabel(guildId, userId) {
   const token = process.env.BOT_TOKEN;
@@ -134,13 +135,16 @@ async function buildSortedLabelList(guildId, ids) {
   return list.sort((a, b) => collator.compare(a, b));
 }
 
-/* ---- webhook helpers ---- */
+/* ---- webhook helpers（含 PATCH 失敗 log） ---- */
 async function patchOriginal(appId, token, body) {
-  await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const resp = await fetch(
+    `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`,
+    { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+  );
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "<no body>");
+    console.error("patch failed", resp.status, txt);
+  }
 }
 async function followup(appId, token, body) {
   await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
@@ -175,6 +179,7 @@ export default async function handler(req, res) {
 
     // /cteam：公開 → defer → PATCH @original
     if (name === "cteam") {
+      console.log("hit /cteam vA"); // <== 入口 log
       res
         .status(200)
         .json({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
@@ -337,7 +342,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 其餘（join/leave）→ 先 defer update
+    // 其餘（join/leave）→ 先 defer update，再 PATCH
     res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
 
     (async () => {
@@ -400,7 +405,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  // fallback
+  // fallback（避免有地方回「OK」之類的佔位字樣）
   return res.status(200).json({
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
     data: { content: "未處理的互動類型。", flags: 64 },
