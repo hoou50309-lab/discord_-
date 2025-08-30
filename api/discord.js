@@ -18,7 +18,7 @@ const now = () => new Date().toISOString().slice(11, 19);
 
 // env 開關：預設啟用 verify-only
 const VERIFY_ONLY_DEFAULT =
-  (process.env.VERIFY_ONLY ?? 'true').toString().toLowerCase() !== 'false';
+  (process.env.VERIFY_ONLY ?? 'false').toString().toLowerCase() !== 'false';
 function isVerifyOnly(req) {
   const q = (req.query?.verify ?? req.query?.mode)?.toString().toLowerCase();
   if (q === '1' || q === 'true' || q === 'verify') return true;
