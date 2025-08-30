@@ -1,9 +1,10 @@
-// api/discord.js — 穩定版
+// api/discord.js — 穩定版（無 /myteams）
 // - /cteam：直接回最終內容（type:4），避免 thinking + PATCH
-// - 按鈕 join/leave：即時 UPDATE_MESSAGE（type:7），不走 webhook → 不 timeout、不重發訊息
-// - /myteams、/leaveall：直接回 ephemeral（type:4 + flags:64）
-// - view_all：回一則 ephemeral 名單
-// - 仍使用簡單的「文字內註解」保存狀態（multi/members/title），但不再附加版本字樣
+// - 按鈕 join/leave：即時 UPDATE_MESSAGE（type:7），只會更新原訊息，不會新開訊息
+// - /leaveall：直接回 ephemeral 提示
+// - 狀態（multi/members/title）以 spoiler + Base64 隱藏在訊息末端，畫面不會看到；
+//   同時保留對舊訊息（<!-- ... -->）的讀取相容。
+// - 可選 BOT_TOKEN：僅在「查看所有名單」時用於把 mention 變成易讀的人名（缺少也能運作）
 
 import {
   InteractionType,
@@ -13,7 +14,7 @@ import {
 
 export const config = { runtime: "nodejs" };
 
-// 版本戳只用在 Logs（不插到訊息內容）
+// 僅用於 server 端 log 的版本戳
 const VERSION =
   "dbg-" +
   new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 12) +
@@ -58,7 +59,7 @@ function parseCapsFromContent(content) {
     .filter((n) => n !== null);
 }
 
-/* -------- state 存在訊息文字的註解 -------- */
+/* -------- 舊式 HTML 註解讀寫（僅做相容用） -------- */
 function between(s, start, stop) {
   const a = s.indexOf(start);
   if (a === -1) return null;
@@ -73,13 +74,42 @@ function removeBlock(s, start, stop) {
   if (b === -1) return s.slice(0, a).trim();
   return (s.slice(0, a) + s.slice(b + stop.length)).trim();
 }
+
+/* -------- 新版隱藏狀態：spoiler + Base64 -------- */
+const b64e = (x) => Buffer.from(String(x), "utf8").toString("base64");
+const b64d = (x) => Buffer.from(String(x), "base64").toString("utf8");
+
+const RE_M   = /\|\|<m:([01])>\|\|/;
+const RE_MEM = /\|\|<mem:([A-Za-z0-9+/=]+)>\|\|/;
+const RE_TTL = /\|\|<ttl:([A-Za-z0-9+/=]+)>\|\|/;
+
+const RE_M_ALL   = new RegExp(RE_M, "g");
+const RE_MEM_ALL = new RegExp(RE_MEM, "g");
+const RE_TTL_ALL = new RegExp(RE_TTL, "g");
+
 function getMulti(content) {
+  const m = content.match(RE_M);
+  if (m) return m[1] === "1";
+  // fallback（舊訊息）
   return (between(content, "<!-- multi:", " -->") || "").trim() === "true";
 }
 function setMulti(content, multi) {
-  return `${removeBlock(content, "<!-- multi:", " -->")}\n\n<!-- multi:${multi ? "true" : "false"} -->`;
+  let s = content.replace(RE_M_ALL, "");
+  s = removeBlock(s, "<!-- multi:", " -->");
+  return `${s}\n\n||<m:${multi ? "1" : "0"}>||`;
 }
+
 function getMembers(content, count) {
+  try {
+    const m = content.match(RE_MEM);
+    if (m) {
+      const obj = JSON.parse(b64d(m[1]));
+      for (let i = 1; i <= count; i++) if (!obj[String(i)]) obj[String(i)] = [];
+      return obj;
+    }
+  } catch { /* ignore */ }
+
+  // fallback（舊訊息）
   try {
     const json = between(content, "<!-- members:", " -->");
     if (!json)
@@ -92,18 +122,26 @@ function getMembers(content, count) {
   }
 }
 function setMembers(content, obj) {
-  return `${removeBlock(content, "<!-- members:", " -->")}\n<!-- members: ${JSON.stringify(obj)} -->`;
+  let s = content.replace(RE_MEM_ALL, "");
+  s = removeBlock(s, "<!-- members:", " -->");
+  return `${s}\n||<mem:${b64e(JSON.stringify(obj))}>||`;
 }
+
 function getTitle(content) {
+  try {
+    const m = content.match(RE_TTL);
+    if (m) return b64d(m[1]).trim();
+  } catch { /* ignore */ }
+  // fallback（舊訊息）
   return (between(content, "<!-- title:", " -->") || "").trim();
 }
 function setTitle(content, title) {
-  const w = removeBlock(content, "<!-- title:", " -->");
-  // 不再附加 VERSION；只純存 title
-  return title ? `${w}\n<!-- title: ${title} -->` : w;
+  let s = content.replace(RE_TTL_ALL, "");
+  s = removeBlock(s, "<!-- title:", " -->");
+  return title ? `${s}\n||<ttl:${b64e(title)}>||` : s;
 }
 
-/* -------- 5 列封頂的按鈕排版（2*N + 1 ≤ 25） -------- */
+/* -------- 按鈕列：最多 5 列（每列 ≤5 顆），支援最多 12 團 -------- */
 function buildComponentsPacked(caps) {
   const buttons = [];
   caps.forEach((_, i) => {
@@ -133,9 +171,7 @@ async function fetchMemberLabel(guildId, userId) {
     const base = m?.user?.global_name || m?.user?.username || `User ${userId}`;
     const nick = (m?.nick || "").trim();
     return nick ? `${base} (${nick})` : base;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 async function buildSortedLabelList(guildId, ids) {
   const labels = await Promise.all(ids.map((id) => fetchMemberLabel(guildId, id)));
@@ -148,42 +184,35 @@ async function buildSortedLabelList(guildId, ids) {
 export default async function handler(req, res) {
   console.log("[ENTER]", { url: req.url, method: req.method, VERSION });
 
-  if (req.method === "HEAD") { console.log("HEAD pong"); return res.status(200).end(); }
-  if (req.method !== "POST") { console.log("405"); return res.status(405).send("Method Not Allowed"); }
+  if (req.method === "HEAD") { return res.status(200).end(); }
+  if (req.method !== "POST") { return res.status(405).send("Method Not Allowed"); }
 
   const sig = req.headers["x-signature-ed25519"];
   const ts  = req.headers["x-signature-timestamp"];
   const raw = await readRawBody(req);
-  console.log("rawBody.len", raw?.length);
 
   const ok = verifyKey(raw, sig, ts, process.env.PUBLIC_KEY);
-  if (!ok) { console.error("verifyKey failed"); return res.status(401).send("invalid request signature"); }
+  if (!ok) return res.status(401).send("invalid request signature");
 
   const i = JSON.parse(raw);
-  console.log("interaction", { type: i.type, name: i.data?.name, guild: i.guild_id, channel: i.channel_id });
 
   // PING
   if (i.type === InteractionType.PING) {
-    console.log("PING -> PONG");
     return res.status(200).json({ type: InteractionResponseType.PONG });
   }
 
   // Slash commands
   if (i.type === InteractionType.APPLICATION_COMMAND) {
     const name = i.data?.name;
-    console.log("slash name:", name);
 
     // /cteam：直接回最終內容（type:4）
     if (name === "cteam") {
-      console.log("hit /cteam immediate", { VERSION });
-
       try {
         const capsRaw    = i.data.options?.find(o => o.name === "caps")?.value ?? "12,12,12";
         const allowMulti = i.data.options?.find(o => o.name === "multi")?.value ?? false;
         const title      = (i.data.options?.find(o => o.name === "title")?.value ?? "").trim();
 
         const caps = parseCapsInput(capsRaw);
-        console.log("cteam parsed caps", caps);
 
         // 上限：最多 12 團（2*N + 1 ≤ 25 顆按鈕）
         if (!caps.length || caps.length > 12) {
@@ -193,7 +222,6 @@ export default async function handler(req, res) {
           });
         }
 
-        // 文字
         let content = buildContentFromCaps(caps);
         if (title) content = `${title}\n\n${content}`;
         content = setMulti(content, !!allowMulti);
@@ -201,17 +229,15 @@ export default async function handler(req, res) {
           content,
           Object.fromEntries(caps.map((_, idx) => [String(idx + 1), []]))
         );
-        content = setTitle(content, title); // 不附加 VERSION
-
-        const body = {
-          content,
-          components: buildComponentsPacked(caps),
-          allowed_mentions: { parse: [] },
-        };
+        content = setTitle(content, title); // 不附加版本戳
 
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: body,
+          data: {
+            content,
+            components: buildComponentsPacked(caps),
+            allowed_mentions: { parse: [] },
+          },
         });
       } catch (e) {
         console.error("cteam error", e);
@@ -222,60 +248,8 @@ export default async function handler(req, res) {
       }
     }
 
-    // /myteams：直接回 ephemeral
-    if (name === "myteams") {
-      console.log("hit /myteams", { VERSION });
-
-      try {
-        const messageId = (i.data.options?.find(o=>o.name==="message_id")?.value ?? "").trim();
-        if (!messageId) {
-          return res.status(200).json({
-            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: { content: `請提供 message_id（訊息「更多」→ 複製連結）。`, flags: 64 }
-          });
-        }
-        if (!process.env.BOT_TOKEN) {
-          return res.status(200).json({
-            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: { content: `未設定 BOT_TOKEN，無法讀取訊息。`, flags: 64 }
-          });
-        }
-
-        const r = await fetch(
-          `https://discord.com/api/v10/channels/${i.channel_id}/messages/${messageId}`,
-          { headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` } }
-        );
-        if (!r.ok) {
-          return res.status(200).json({
-            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: { content: `找不到該訊息或權限不足。`, flags: 64 }
-          });
-        }
-        const msg = await r.json();
-        const capsNow = parseCapsFromContent(msg.content);
-        const members = getMembers(msg.content, capsNow.length);
-        const uid = i.member?.user?.id || i.user?.id;
-
-        const mine = Object.entries(members)
-          .filter(([, arr]) => arr.includes(uid))
-          .map(([k]) => parseInt(k, 10));
-
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: `${mine.length ? `你目前在第 ${mine.join(", ")} 團。` : "你目前未加入任何一團。"}`, flags: 64 }
-        });
-      } catch (e) {
-        console.error("myteams error", e);
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: `查詢時發生錯誤。`, flags: 64 }
-        });
-      }
-    }
-
     // /leaveall：直接回 ephemeral
     if (name === "leaveall") {
-      console.log("hit /leaveall", { VERSION });
       return res.status(200).json({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
         data: { content: `請到開團訊息下方，對你所在的每團按「離開」。`, flags: 64 }
@@ -283,7 +257,6 @@ export default async function handler(req, res) {
     }
 
     // 未知指令
-    console.log("unknown slash name", name);
     return res.status(200).json({
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
       data: { content: `未知指令：${name}`, flags: 64 }
@@ -293,14 +266,11 @@ export default async function handler(req, res) {
   // 按鈕互動
   if (i.type === InteractionType.MESSAGE_COMPONENT) {
     const customId = i.data?.custom_id;
-    console.log("component", { customId, VERSION });
-
     const msg = i.message;
     const userId = i.member?.user?.id || i.user?.id;
 
     // 查看所有名單：回一則 ephemeral，不修改原訊息
     if (customId === "view_all") {
-      console.log("hit view_all");
       const capsNow = parseCapsFromContent(msg.content);
       const members = getMembers(msg.content, capsNow.length);
       const guildId = i.guild_id;
@@ -327,7 +297,6 @@ export default async function handler(req, res) {
     // 其餘 join/leave：直接 UPDATE_MESSAGE（type:7）
     const m = customId.match(/^(join|leave)_(\d+)$/);
     if (!m) {
-      console.log("unknown component id", customId);
       return res.status(200).json({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
         data: { content: `未知按鈕。`, flags: 64 }
@@ -398,7 +367,6 @@ export default async function handler(req, res) {
   }
 
   // 其他型別
-  console.log("fallback type", i.type);
   return res.status(200).json({
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
     data: { content: `DEBUG fallback type=${i.type}`, flags: 64 }
