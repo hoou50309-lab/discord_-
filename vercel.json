@@ -3,8 +3,5 @@
     "api/discord.js": {
       "maxDuration": 10
     }
-  },
-  "crons": [
-    { "path": "/api/cron-ping", "schedule": "*/5 * * * *" }
-  ]
+  }
 }
