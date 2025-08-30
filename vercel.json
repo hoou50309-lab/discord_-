@@ -1,7 +1,12 @@
 {
   "functions": {
     "api/discord.js": {
-      "maxDuration": 10
+      "memory": 256,
+      "maxDuration": 10,
+      "regions": ["iad1"]
     }
-  }
+  },
+  "crons": [
+    { "path": "/api/discord", "schedule": "*/5 * * * *" }
+  ]
 }
