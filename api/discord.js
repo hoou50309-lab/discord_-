@@ -1,9 +1,9 @@
-// api/discord.js — 方案A（/cteam 直接回最終訊息）+ 加強偵錯
-// - /cteam：直接回最終內容（type:4），不再使用 defer + PATCH，避免卡在「正在思考…」
-// - /myteams、/leaveall：ephemeral → defer → PATCH @original
-// - 按鈕：最多 5 列（每列 ≤ 5 顆），最多支援 12 團；更新仍用 PATCH（含逾時保險）
-// - 重要 log：'hit /cteam vB immediate'、'patch ok/failed/error' 等
-// - fallback 不再回 OK，改回 DEBUG 訊息
+// api/discord.js — 穩定版
+// - /cteam：直接回最終內容（type:4），避免 thinking + PATCH
+// - 按鈕 join/leave：即時 UPDATE_MESSAGE（type:7），不走 webhook → 不 timeout、不重發訊息
+// - /myteams、/leaveall：直接回 ephemeral（type:4 + flags:64）
+// - view_all：回一則 ephemeral 名單
+// - 仍使用簡單的「文字內註解」保存狀態（multi/members/title），但不再附加版本字樣
 
 import {
   InteractionType,
@@ -13,7 +13,7 @@ import {
 
 export const config = { runtime: "nodejs" };
 
-// 部署版本戳
+// 版本戳只用在 Logs（不插到訊息內容）
 const VERSION =
   "dbg-" +
   new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 12) +
@@ -58,7 +58,7 @@ function parseCapsFromContent(content) {
     .filter((n) => n !== null);
 }
 
-/* -------- state in content comments -------- */
+/* -------- state 存在訊息文字的註解 -------- */
 function between(s, start, stop) {
   const a = s.indexOf(start);
   if (a === -1) return null;
@@ -99,6 +99,7 @@ function getTitle(content) {
 }
 function setTitle(content, title) {
   const w = removeBlock(content, "<!-- title:", " -->");
+  // 不再附加 VERSION；只純存 title
   return title ? `${w}\n<!-- title: ${title} -->` : w;
 }
 
@@ -143,49 +144,6 @@ async function buildSortedLabelList(guildId, ids) {
   return list.sort((a, b) => collator.compare(a, b));
 }
 
-/* -------- webhook helpers（含逾時保險） -------- */
-async function patchOriginal(appId, token, body, tag = "") {
-  console.log("cteam start patch", tag);
-
-  // 真正的 PATCH 請求
-  const req = fetch(
-    `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`,
-    {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }
-  )
-    .then(async (resp) => {
-      const text = await resp.text().catch(() => "<no body>");
-      return { ok: resp.ok, status: resp.status, text };
-    })
-    .catch((e) => ({ ok: false, status: 0, text: String(e || "fetch error") }));
-
-  // 逾時保險（3.5s）
-  const timeout = new Promise((resolve) =>
-    setTimeout(() => resolve({ ok: false, status: -1, text: "timeout" }), 3500)
-  );
-
-  const ans = await Promise.race([req, timeout]);
-
-  if (ans.ok) {
-    console.log("patch ok", tag, ans.status);
-    return true;
-  }
-  console.error("patch failed/error", tag, ans.status, ans.text);
-  return false;
-}
-
-async function followup(appId, token, body, tag = "") {
-  const resp = await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  console.log("followup", tag, resp.status);
-}
-
 /* ================= handler ================= */
 export default async function handler(req, res) {
   console.log("[ENTER]", { url: req.url, method: req.method, VERSION });
@@ -217,7 +175,7 @@ export default async function handler(req, res) {
 
     // /cteam：直接回最終內容（type:4）
     if (name === "cteam") {
-      console.log("hit /cteam vB immediate", { VERSION });
+      console.log("hit /cteam immediate", { VERSION });
 
       try {
         const capsRaw    = i.data.options?.find(o => o.name === "caps")?.value ?? "12,12,12";
@@ -231,10 +189,11 @@ export default async function handler(req, res) {
         if (!caps.length || caps.length > 12) {
           return res.status(200).json({
             type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: { content: `名額格式錯誤，或團數過多（最多 12 團）。 [${VERSION}]`, flags: 64 }
+            data: { content: `名額格式錯誤，或團數過多（最多 12 團）。`, flags: 64 }
           });
         }
 
+        // 文字
         let content = buildContentFromCaps(caps);
         if (title) content = `${title}\n\n${content}`;
         content = setMulti(content, !!allowMulti);
@@ -242,7 +201,7 @@ export default async function handler(req, res) {
           content,
           Object.fromEntries(caps.map((_, idx) => [String(idx + 1), []]))
         );
-        content = setTitle(content, `${title ? title + " " : ""}[${VERSION}]`);
+        content = setTitle(content, title); // 不附加 VERSION
 
         const body = {
           content,
@@ -258,34 +217,28 @@ export default async function handler(req, res) {
         console.error("cteam error", e);
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: `建立訊息時發生錯誤。 [${VERSION}]`, flags: 64 }
+          data: { content: `建立訊息時發生錯誤。`, flags: 64 }
         });
       }
     }
 
-    // /myteams（ephemeral）
+    // /myteams：直接回 ephemeral
     if (name === "myteams") {
       console.log("hit /myteams", { VERSION });
-      res.status(200).json({
-        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { flags: 64 },
-      });
 
       try {
         const messageId = (i.data.options?.find(o=>o.name==="message_id")?.value ?? "").trim();
         if (!messageId) {
-          await patchOriginal(i.application_id, i.token, {
-            content: `請提供 message_id（訊息「更多」→ 複製連結）。 [${VERSION}]`,
-            flags: 64,
-          }, "myteams-noid");
-          return;
+          return res.status(200).json({
+            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+            data: { content: `請提供 message_id（訊息「更多」→ 複製連結）。`, flags: 64 }
+          });
         }
         if (!process.env.BOT_TOKEN) {
-          await patchOriginal(i.application_id, i.token, {
-            content: `未設定 BOT_TOKEN，無法讀取訊息。 [${VERSION}]`,
-            flags: 64,
-          }, "myteams-nobot");
-          return;
+          return res.status(200).json({
+            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+            data: { content: `未設定 BOT_TOKEN，無法讀取訊息。`, flags: 64 }
+          });
         }
 
         const r = await fetch(
@@ -293,11 +246,10 @@ export default async function handler(req, res) {
           { headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` } }
         );
         if (!r.ok) {
-          await patchOriginal(i.application_id, i.token, {
-            content: `找不到該訊息或權限不足。 [${VERSION}]`,
-            flags: 64,
-          }, "myteams-404");
-          return;
+          return res.status(200).json({
+            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+            data: { content: `找不到該訊息或權限不足。`, flags: 64 }
+          });
         }
         const msg = await r.json();
         const capsNow = parseCapsFromContent(msg.content);
@@ -308,47 +260,33 @@ export default async function handler(req, res) {
           .filter(([, arr]) => arr.includes(uid))
           .map(([k]) => parseInt(k, 10));
 
-        await patchOriginal(i.application_id, i.token, {
-          content: `${mine.length ? `你目前在第 ${mine.join(", ")} 團。` : "你目前未加入任何一團。"} [${VERSION}]`,
-          flags: 64,
-        }, "myteams-ok");
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: `${mine.length ? `你目前在第 ${mine.join(", ")} 團。` : "你目前未加入任何一團。"}`, flags: 64 }
+        });
       } catch (e) {
         console.error("myteams error", e);
-        await patchOriginal(i.application_id, i.token, {
-          content: `查詢時發生錯誤。 [${VERSION}]`,
-          flags: 64,
-        }, "myteams-catch");
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: `查詢時發生錯誤。`, flags: 64 }
+        });
       }
-      return;
     }
 
-    // /leaveall（ephemeral）
+    // /leaveall：直接回 ephemeral
     if (name === "leaveall") {
       console.log("hit /leaveall", { VERSION });
-      res.status(200).json({
-        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { flags: 64 },
+      return res.status(200).json({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: `請到開團訊息下方，對你所在的每團按「離開」。`, flags: 64 }
       });
-      try {
-        await patchOriginal(i.application_id, i.token, {
-          content: `請到開團訊息下方，對你所在的每團按「離開」。 [${VERSION}]`,
-          flags: 64,
-        }, "leaveall-ok");
-      } catch (e) {
-        console.error("leaveall error", e);
-        await patchOriginal(i.application_id, i.token, {
-          content: `處理時發生錯誤。 [${VERSION}]`,
-          flags: 64,
-        }, "leaveall-catch");
-      }
-      return;
     }
 
     // 未知指令
     console.log("unknown slash name", name);
     return res.status(200).json({
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: { content: `DEBUG unknown slash: ${name} [${VERSION}]`, flags: 64 }
+      data: { content: `未知指令：${name}`, flags: 64 }
     });
   }
 
@@ -360,6 +298,7 @@ export default async function handler(req, res) {
     const msg = i.message;
     const userId = i.member?.user?.id || i.user?.id;
 
+    // 查看所有名單：回一則 ephemeral，不修改原訊息
     if (customId === "view_all") {
       console.log("hit view_all");
       const capsNow = parseCapsFromContent(msg.content);
@@ -381,80 +320,87 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: parts.join("\n\n") + `\n[${VERSION}]`, flags: 64, allowed_mentions: { parse: [] } },
+        data: { content: parts.join("\n\n"), flags: 64, allowed_mentions: { parse: [] } },
       });
     }
 
-    // 其餘 join/leave
-    res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
+    // 其餘 join/leave：直接 UPDATE_MESSAGE（type:7）
+    const m = customId.match(/^(join|leave)_(\d+)$/);
+    if (!m) {
+      console.log("unknown component id", customId);
+      return res.status(200).json({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: `未知按鈕。`, flags: 64 }
+      });
+    }
 
-    (async () => {
-      try {
-        const capsNow = parseCapsFromContent(msg.content);
-        let multi = getMulti(msg.content);
-        let members = getMembers(msg.content, capsNow.length);
-        const title = getTitle(msg.content);
+    const action = m[1];
+    const idx = parseInt(m[2], 10); // 1-based
 
-        const m = customId.match(/^(join|leave)_(\d+)$/);
-        if (!m) { console.log("unknown component id", customId); return; }
-        const action = m[1];
-        const idx = parseInt(m[2], 10); // 1-based
+    const capsNow = parseCapsFromContent(msg.content);
+    let multi = getMulti(msg.content);
+    let members = getMembers(msg.content, capsNow.length);
+    const title = getTitle(msg.content);
 
-        const ids = members[String(idx)] || (members[String(idx)] = []);
-        const inGroup = ids.includes(userId);
+    const ids = members[String(idx)] || (members[String(idx)] = []);
+    const inGroup = ids.includes(userId);
 
-        async function ep(text, tag) {
-          await followup(i.application_id, i.token, {
-            content: `${text} [${VERSION}]`,
-            flags: 64,
-            allowed_mentions: { parse: [] },
-          }, tag);
+    if (action === "join") {
+      if (!multi) {
+        const has = Object.values(members).some((arr) => arr.includes(userId));
+        if (has) {
+          return res.status(200).json({
+            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+            data: { content: `你已在其他團中。`, flags: 64 }
+          });
         }
-
-        if (action === "join") {
-          if (!multi) {
-            const has = Object.values(members).some((arr) => arr.includes(userId));
-            if (has) return ep("你已在其他團中。", "join-has");
-          }
-          if (capsNow[idx - 1] <= 0) return ep("該團已滿。", "join-full");
-          if (!inGroup) {
-            ids.push(userId);
-            capsNow[idx - 1] -= 1;
-          } else {
-            return ep("你已在該團。", "join-dup");
-          }
-        } else if (action === "leave") {
-          if (!inGroup) return ep("你不在該團。", "leave-notin");
-          members[String(idx)] = ids.filter((x) => x !== userId);
-          capsNow[idx - 1] += 1;
-        }
-
-        let content = buildContentFromCaps(capsNow);
-        if (title) content = `${title}\n\n${content}`;
-        content = setMulti(content, multi);
-        content = setMembers(content, members);
-        content = setTitle(content, `${title ? title + " " : ""}[${VERSION}]`);
-
-        const body = {
-          content,
-          components: buildComponentsPacked(capsNow),
-          allowed_mentions: { parse: [] },
-        };
-
-        const ok = await patchOriginal(i.application_id, i.token, body, "component-update");
-        if (!ok) await followup(i.application_id, i.token, body, "component-fallback");
-      } catch (e) {
-        console.error("component error", e);
       }
-    })();
+      if (capsNow[idx - 1] <= 0) {
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: `該團已滿。`, flags: 64 }
+        });
+      }
+      if (!inGroup) {
+        ids.push(userId);
+        capsNow[idx - 1] -= 1;
+      } else {
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: `你已在該團。`, flags: 64 }
+        });
+      }
+    } else {
+      if (!inGroup) {
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: `你不在該團。`, flags: 64 }
+        });
+      }
+      members[String(idx)] = ids.filter((x) => x !== userId);
+      capsNow[idx - 1] += 1;
+    }
 
-    return;
+    let content = buildContentFromCaps(capsNow);
+    if (title) content = `${title}\n\n${content}`;
+    content = setMulti(content, multi);
+    content = setMembers(content, members);
+    content = setTitle(content, title);
+
+    return res.status(200).json({
+      type: InteractionResponseType.UPDATE_MESSAGE,
+      data: {
+        content,
+        components: buildComponentsPacked(capsNow),
+        allowed_mentions: { parse: [] },
+      },
+    });
   }
 
-  // fallback — 不再回 OK，改回 DEBUG 訊息
+  // 其他型別
   console.log("fallback type", i.type);
   return res.status(200).json({
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-    data: { content: `DEBUG fallback type=${i.type} [${VERSION}]`, flags: 64 }
+    data: { content: `DEBUG fallback type=${i.type}`, flags: 64 }
   });
 }
