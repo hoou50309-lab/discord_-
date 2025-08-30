@@ -1,384 +1,513 @@
-// api/discord.js — Pro version (HEAD + await verifyKey + deferred + extras)
-// Features:
-// - /cteam caps/multi/title/defaults（預設 12,12,12；先回 type 5 再發公開訊息）
-// - Buttons: join_N / leave_N + view_all（ephemeral）
-// - 名單顯示暱稱/名稱並排序（需 BOT_TOKEN；抓不到就顯示 <@id> 不會 @）
-// - 內容內嵌狀態：<!-- multi:... -->、<!-- members:{...} -->、<!-- title:... -->、<!-- msg:ID -->
-// - 基礎防衝突：PATCH 前（若有 BOT_TOKEN）會抓最新訊息內容，失敗短暫重試
-// - /myteams [message_id]（需 BOT_TOKEN）/ leaveall（安全指引）
-
+// api/discord.js — Verify-Only + Stable Full Function (default verify-only ON)
 import {
   InteractionType,
   InteractionResponseType,
   verifyKey,
 } from 'discord-interactions';
 
-// ---------- utils ----------
+export const config = { runtime: 'nodejs' };
+
+// ===== utils =====
 async function readRawBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   return Buffer.concat(chunks).toString('utf8');
 }
+const j = (res, code, obj) => res.status(code).json(obj);
+const now = () => new Date().toISOString().slice(11, 19);
 
-const HAN = ['零','一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六','十七','十八','十九','二十'];
-const toHan = (n) => HAN[n] ?? String(n);
-
-// content helpers
-function parseCaps(content) {
-  const lines = content.split('\n').map(s => s.trim()).filter(Boolean);
-  const caps = [];
-  for (const s of lines) {
-    const m = s.match(/（-(\d+)）$/);
-    if (m) caps.push(parseInt(m[1], 10));
-  }
-  return caps;
-}
-function buildContentFromCaps(caps) {
-  return caps.map((n, i) => `第${toHan(i + 1)}團（-${n}）`).join('\n\n');
-}
-function buildComponents(caps) {
-  const rows = caps.map((_, i) => ({
-    type: 1,
-    components: [
-      { type: 2, style: 3, custom_id: `join_${i+1}`,  label: `加入第${toHan(i+1)}團` },
-      { type: 2, style: 2, custom_id: `leave_${i+1}`, label: `離開第${toHan(i+1)}團` },
-    ],
-  }));
-  if (rows.length === 0) rows.push({ type: 1, components: [] });
-  rows[rows.length - 1].components.push({ type: 2, style: 1, custom_id: 'view_all', label: '查看所有名單' });
-  return rows;
+// env 開關：預設啟用 verify-only
+const VERIFY_ONLY_DEFAULT =
+  (process.env.VERIFY_ONLY ?? 'true').toString().toLowerCase() !== 'false';
+function isVerifyOnly(req) {
+  const q = (req.query?.verify ?? req.query?.mode)?.toString().toLowerCase();
+  if (q === '1' || q === 'true' || q === 'verify') return true;
+  if (q === '0' || q === 'false' || q === 'full') return false;
+  const h = req.headers['x-verify-only']?.toString().toLowerCase();
+  if (h === '1' || h === 'true') return true;
+  if (h === '0' || h === 'false') return false;
+  return VERIFY_ONLY_DEFAULT;
 }
 
-// embed state
-function getMulti(s) {
-  const m = s.match(/<!--\s*multi:(true|false)\s*-->/i);
-  return m ? m[1] === 'true' : false;
-}
-function setMulti(s, multi) {
-  const cleaned = s.replace(/<!--\s*multi:(true|false)\s*-->/i, '').trim();
-  return `${cleaned}\n\n<!-- multi:${multi ? 'true' : 'false'} -->`;
-}
-function getMembers(s, groupCount) {
-  const m = s.match(/<!--\s*members:\s*({[\s\S]*?})\s*-->/i);
-  if (!m) return Object.fromEntries(Array.from({length: groupCount}, (_, i) => [String(i+1), []]));
+// ===== state helpers (hidden comment) =====
+const STATE_RE = /<!--\s*state:\s*({[\s\S]*?})\s*-->/i;
+
+function parseStateFrom(content) {
+  const m = content.match(STATE_RE);
+  if (!m) return null;
   try {
-    const obj = JSON.parse(m[1]);
-    for (let i = 1; i <= groupCount; i++) if (!obj[String(i)]) obj[String(i)] = [];
-    return obj;
-  } catch {
-    return Object.fromEntries(Array.from({length: groupCount}, (_, i) => [String(i+1), []]));
-  }
-}
-function setMembers(s, membersObj) {
-  const without = s.replace(/<!--\s*members:\s*({[\s\S]*?})\s*-->/i, '').trim();
-  return `${without}\n<!-- members: ${JSON.stringify(membersObj)} -->`;
-}
-function getTitle(s) {
-  const m = s.match(/<!--\s*title:\s*([\s\S]*?)\s*-->/i);
-  return m ? m[1].trim() : '';
-}
-function setTitle(s, title) {
-  const without = s.replace(/<!--\s*title:\s*([\s\S]*?)\s*-->/i, '').trim();
-  const t = (title || '').trim();
-  return t ? `${without}\n<!-- title: ${t} -->` : without;
-}
-function getMsgId(s) {
-  const m = s.match(/<!--\s*msg:\s*(\d+)\s*-->/i);
-  return m ? m[1] : '';
-}
-function setMsgId(s, msgId) {
-  const without = s.replace(/<!--\s*msg:\s*(\d+)\s*-->/i, '').trim();
-  return `${without}\n<!-- msg: ${msgId} -->`;
-}
-
-// defaults parser: "1: <@id> <@id>\n2: <@id>"
-function parseDefaults(text, groups) {
-  if (!text) return {};
-  const out = {};
-  const lines = String(text).split('\n');
-  for (const line of lines) {
-    const m = line.match(/^\s*(\d+)\s*:\s*(.*)$/);
-    if (!m) continue;
-    const idx = parseInt(m[1], 10);
-    if (idx < 1 || idx > groups) continue;
-    const ids = Array.from(m[2].matchAll(/<@!?(\d+)>/g)).map(mm => mm[1]);
-    out[String(idx)] = Array.from(new Set(ids));
-  }
-  return out;
-}
-
-// label helpers
-async function fetchMemberLabel(guildId, userId) {
-  const token = process.env.BOT_TOKEN;
-  if (!token || !guildId) return null;
-  try {
-    const r = await fetch(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}`, {
-      headers: { 'Authorization': `Bot ${token}` }
-    });
-    if (!r.ok) return null;
-    const m = await r.json();
-    const base = m?.user?.global_name || m?.user?.username || `User ${userId}`;
-    const nick = (m?.nick || '').trim();
-    return nick ? `${base} (${nick})` : base;
+    return JSON.parse(m[1]);
   } catch {
     return null;
   }
 }
-async function buildSortedLabelList(guildId, ids) {
-  const labels = await Promise.all(ids.map(id => fetchMemberLabel(guildId, id)));
-  const filled = labels.map((label, i) => label || `<@${ids[i]}>`);
-  const collator = new Intl.Collator('zh-Hant', { sensitivity: 'base', numeric: true });
-  return filled.sort((a, b) => collator.compare(a, b));
+
+function setStateInContent(base, stateObj) {
+  const cleaned = base.replace(STATE_RE, '').trim();
+  return `${cleaned}\n\n<!-- state: ${JSON.stringify(stateObj)} -->`;
 }
 
-// helpers for REST
-async function fetchMessage(channelId, messageId) {
-  const token = process.env.BOT_TOKEN;
-  if (!token) return null;
-  const r = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
-    headers: { 'Authorization': `Bot ${token}` }
-  });
-  if (!r.ok) return null;
-  return await r.json();
+// ===== rendering =====
+function mention(uid) {
+  return `<@${uid}>`;
 }
-async function patchMessageWithWebhook(appId, token, messageId, body) {
-  const r = await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}/messages/${messageId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  return r.ok;
+function renderMemberLine(ids) {
+  if (!ids || ids.length === 0) return '（無）';
+  return ids.map(mention).join(' ');
+}
+function renderContent(state) {
+  const capLeft = state.caps; // 剩餘名額陣列
+  const lines = [];
+  if (state.title) lines.push(`${state.title}`);
+  lines.push(
+    `第一團（-${capLeft[0]}）`,
+    ``,
+    `第二團（-${capLeft[1]}）`,
+    ``,
+    `第三團（-${capLeft[2]}）`,
+    ``,
+    `目前名單：`,
+    `第一團： ${renderMemberLine(state.members['1'])}`,
+    `第二團： ${renderMemberLine(state.members['2'])}`,
+    `第三團： ${renderMemberLine(state.members['3'])}`,
+  );
+  return lines.join('\n');
 }
 
-// ---------- main handler ----------
-export default async function handler(req, res) {
-  if (req.method === 'HEAD') { res.status(200).end(); return; }
-  if (req.method !== 'POST') { res.status(405).send('Method Not Allowed'); return; }
+function buildComponents(state) {
+  // Row1: Join buttons
+  const row1 = {
+    type: 1,
+    components: [
+      { type: 2, style: 3, custom_id: 'join_1', label: '加入第一團' },
+      { type: 2, style: 3, custom_id: 'join_2', label: '加入第二團' },
+      { type: 2, style: 3, custom_id: 'join_3', label: '加入第三團' },
+    ],
+  };
+  // Row2: Leave buttons
+  const row2 = {
+    type: 1,
+    components: [
+      { type: 2, style: 2, custom_id: 'leave_1', label: '離開第一團' },
+      { type: 2, style: 2, custom_id: 'leave_2', label: '離開第二團' },
+      { type: 2, style: 2, custom_id: 'leave_3', label: '離開第三團' },
+    ],
+  };
+  // Row3: View list
+  const row3 = {
+    type: 1,
+    components: [
+      { type: 2, style: 1, custom_id: 'view_all', label: '查看所有名單' },
+    ],
+  };
 
-  const sig = req.headers['x-signature-ed25519'];
-  const ts  = req.headers['x-signature-timestamp'];
-  const raw = await readRawBody(req);
+  // 管理用選單（所有人可見；只有 owner 可操作）
+  // Select A: 踢人（列出所有成員）
+  const kickOptions = [];
+  for (const g of [1, 2, 3]) {
+    for (const uid of state.members[String(g)]) {
+      kickOptions.push({
+        label: `第${g}團：${uid}`,
+        value: `kick:${uid}:${g}`,
+      });
+    }
+  }
+  const row4 = {
+    type: 1,
+    components: [
+      {
+        type: 3, // string select
+        custom_id: 'admin_kick',
+        placeholder: '管理名單：踢人（開團者限定）',
+        min_values: 1,
+        max_values: 1,
+        options: kickOptions.slice(0, 25), // 安全：最多 25
+      },
+    ],
+  };
 
-  const ok = await verifyKey(raw, sig, ts, process.env.PUBLIC_KEY);
-  if (!ok) { res.status(401).send('invalid request signature'); return; }
+  // Select B: 移組（對每位成員產生目標組）
+  const moveOptions = [];
+  for (const from of [1, 2, 3]) {
+    for (const uid of state.members[String(from)]) {
+      for (const to of [1, 2, 3]) {
+        if (to === from) continue;
+        moveOptions.push({
+          label: `將 ${uid}：第${from}→第${to}`,
+          value: `move:${uid}:${from}:${to}`,
+        });
+      }
+    }
+  }
+  const row5 = {
+    type: 1,
+    components: [
+      {
+        type: 3,
+        custom_id: 'admin_move',
+        placeholder: '管理名單：移組（開團者限定）',
+        min_values: 1,
+        max_values: 1,
+        options: moveOptions.slice(0, 25),
+      },
+    ],
+  };
 
-  const i = JSON.parse(raw);
+  return [row1, row2, row3, row4, row5];
+}
 
+// ===== business logic =====
+
+function ensureState(state) {
+  // state: { title, caps:[n,n,n], members:{1:[],2:[],3:[]}, multi:false, owner:"id" }
+  if (!state.members) {
+    state.members = { '1': [], '2': [], '3': [] };
+  } else {
+    // 保證 key
+    for (const k of ['1', '2', '3']) if (!state.members[k]) state.members[k] = [];
+  }
+  if (!state.caps) state.caps = [0, 0, 0];
+  if (typeof state.multi !== 'boolean') state.multi = false;
+  return state;
+}
+
+function inWhichGroup(state, uid) {
+  const res = [];
+  for (const g of [1, 2, 3]) {
+    if (state.members[String(g)].includes(uid)) res.push(g);
+  }
+  return res;
+}
+
+function tryJoin(state, uid, g) {
+  g = Number(g);
+  // 不允許重複入多團
+  const my = inWhichGroup(state, uid);
+  if (!state.multi && my.length > 0) {
+    return { ok: false, msg: `你已在第 ${my.join(',')} 團` };
+  }
+  if (state.members[String(g)].includes(uid)) {
+    return { ok: false, msg: `你已在第${g}團` };
+  }
+  if (state.caps[g - 1] <= 0) {
+    return { ok: false, msg: `第${g}團已滿` };
+  }
+  state.members[String(g)].push(uid);
+  state.caps[g - 1] -= 1;
+  return { ok: true };
+}
+
+function tryLeave(state, uid, g) {
+  g = Number(g);
+  const arr = state.members[String(g)];
+  const idx = arr.indexOf(uid);
+  if (idx === -1) return { ok: false, msg: `你不在第${g}團` };
+  arr.splice(idx, 1);
+  state.caps[g - 1] += 1;
+  return { ok: true };
+}
+
+function tryKick(state, uid, g) {
+  g = Number(g);
+  const arr = state.members[String(g)];
+  const idx = arr.indexOf(uid);
+  if (idx === -1) return { ok: false, msg: `該成員不在第${g}團` };
+  arr.splice(idx, 1);
+  state.caps[g - 1] += 1;
+  return { ok: true };
+}
+
+function tryMove(state, uid, from, to) {
+  from = Number(from);
+  to = Number(to);
+  if (from === to) return { ok: false, msg: '來源與目標相同' };
+  const arr = state.members[String(from)];
+  const idx = arr.indexOf(uid);
+  if (idx === -1) return { ok: false, msg: `該成員不在第${from}團` };
+  if (state.caps[to - 1] <= 0) return { ok: false, msg: `第${to}團已滿` };
+  arr.splice(idx, 1);
+  state.caps[from - 1] += 1;
+  state.members[String(to)].push(uid);
+  state.caps[to - 1] -= 1;
+  return { ok: true };
+}
+
+function rebuildMessage(state) {
+  const content = setStateInContent(renderContent(state), state);
+  const components = buildComponents(state);
+  return { content, components };
+}
+
+// 解析 /cteam 參數
+function parseCaps(str) {
+  return String(str || '12,12,12')
+    .split(',')
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => Number.isFinite(n) && n >= 0)
+    .slice(0, 3)
+    .concat([0, 0, 0])
+    .slice(0, 3);
+}
+
+function parseDefaults(str) {
+  // 例：
+  // 1: <@111> <@222>
+  // 2: <@333>
+  // 3:
+  const out = { '1': [], '2': [], '3': [] };
+  if (!str) return out;
+  const lines = String(str).split(/\r?\n/);
+  for (const ln of lines) {
+    const m = ln.match(/^\s*([123])\s*:\s*(.*)$/);
+    if (!m) continue;
+    const g = m[1];
+    const rest = m[2];
+    const ids = Array.from(rest.matchAll(/<@!?(\d+)>/g)).map((x) => x[1]);
+    out[g].push(...ids);
+  }
+  return out;
+}
+
+// ===== FULL APP HANDLER =====
+async function fullAppHandler(interaction, req, res) {
   // PING
-  if (i.type === InteractionType.PING) {
-    return res.status(200).json({ type: InteractionResponseType.PONG });
+  if (interaction.type === InteractionType.PING) {
+    return j(res, 200, { type: InteractionResponseType.PONG });
   }
 
-  // Slash commands
-  if (i.type === InteractionType.APPLICATION_COMMAND) {
-    const name = i.data?.name;
+  // Slash: /cteam
+  if (
+    interaction.type === InteractionType.APPLICATION_COMMAND &&
+    interaction.data?.name === 'cteam'
+  ) {
+    const opts = interaction.data.options || [];
+    const getOpt = (name) => opts.find((o) => o.name === name)?.value;
 
-    // ---------- /cteam ----------
-    if (name === 'cteam') {
-      // Immediately defer (type 5)
-      res.status(200).json({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+    const caps = parseCaps(getOpt('caps'));
+    const multi = !!getOpt('multi'); // 預設 false
+    const title = getOpt('title') ? String(getOpt('title')) : '';
+    const defaults = parseDefaults(getOpt('defaults'));
 
-      const capsRaw    = i.data.options?.find(o => o.name === 'caps')?.value ?? '12,12,12';
-      const allowMulti = i.data.options?.find(o => o.name === 'multi')?.value ?? false;
-      const title      = (i.data.options?.find(o => o.name === 'title')?.value ?? '').trim();
-      const defaultsTx = (i.data.options?.find(o => o.name === 'defaults')?.value ?? '').trim();
+    // 初始 state
+    const owner = interaction.member?.user?.id || interaction.user?.id;
+    const state = ensureState({
+      title,
+      caps: [...caps],
+      members: { '1': [], '2': [], '3': [] },
+      multi,
+      owner,
+    });
 
-      const caps = String(capsRaw).split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n >= 0);
-      if (!caps.length || caps.length * 2 > 25) {
-        await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: '名額格式錯誤或團數過多（最多 12 團）。', flags: 64 })
-        });
-        return;
-      }
-
-      // Build initial state
-      let content = buildContentFromCaps(caps);
-      if (title) content = `${title}\n\n${content}`;
-      content = setMulti(content, !!allowMulti);
-
-      // members with defaults
-      let members = Object.fromEntries(caps.map((_, idx) => [String(idx+1), []]));
-      const preset = parseDefaults(defaultsTx, caps.length);
-      for (const k of Object.keys(preset)) {
-        const idx = parseInt(k, 10);
-        const ids = preset[k];
-        for (const uid of ids) {
-          if (!members[k].includes(uid)) {
-            members[k].push(uid);
-            if (caps[idx-1] > 0) caps[idx-1] -= 1;
-          }
+    // 套預設名單
+    for (const g of [1, 2, 3]) {
+      for (const uid of defaults[String(g)]) {
+        if (!state.members[String(g)].includes(uid) && state.caps[g - 1] > 0) {
+          state.members[String(g)].push(uid);
+          state.caps[g - 1] -= 1;
         }
       }
-      content = setMembers(content, members);
-      content = setTitle(content, title);
-
-      // Post the message as follow-up (wait to get id)
-      const follow = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}?wait=true`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content,
-          components: buildComponents(caps),
-          allowed_mentions: { parse: [] }
-        })
-      }).then(r => r.json()).catch(() => null);
-
-      if (!follow?.id) return;
-
-      // Append msg id metadata
-      const withMsg = setMsgId(content, follow.id);
-      await patchMessageWithWebhook(i.application_id, i.token, follow.id, { content: withMsg });
-      return;
     }
 
-    // ---------- /myteams ----------
-    if (name === 'myteams') {
-      const targetId = (i.data.options?.find(o => o.name === 'message_id')?.value ?? '').trim();
-      if (!targetId) {
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '請提供 message_id（在訊息「更多」→ 複製連結），或直接在開團訊息下方點「查看所有名單」。', flags: 64 }
-        });
-      }
-      if (!process.env.BOT_TOKEN) {
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '系統未設定 BOT_TOKEN，無法讀取指定訊息。請改用「查看所有名單」按鈕。', flags: 64 }
-        });
-      }
-      const msg = await fetchMessage(i.channel_id, targetId);
-      if (!msg) {
-        return res.status(200).json({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '找不到該訊息，或我沒有權限讀取。', flags: 64 }
-        });
-      }
-      const capsNow = parseCaps(msg.content);
-      const members = getMembers(msg.content, capsNow.length);
-      const uid = i.member?.user?.id || i.user?.id;
-      const my = Object.entries(members).filter(([, arr]) => arr.includes(uid)).map(([k]) => parseInt(k, 10));
-      const reply = my.length ? `你目前在第 ${my.join(', ')} 團。` : '你目前未加入任何一團。';
-      return res.status(200).json({
+    const { content, components } = rebuildMessage(state);
+
+    return j(res, 200, {
+      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: {
+        content,
+        components,
+        allowed_mentions: { parse: [] }, // 不 ping
+      },
+    });
+  }
+
+  // Components
+  if (interaction.type === InteractionType.MESSAGE_COMPONENT) {
+    const cid = interaction.data?.custom_id || '';
+    const message = interaction.message;
+    const content = message?.content || '';
+    const state = ensureState(parseStateFrom(content) || {});
+
+    // 查看名單（ephemeral）
+    if (cid === 'view_all') {
+      const text =
+        [
+          `目前名單（${now()}）：`,
+          `第一團： ${renderMemberLine(state.members['1'])}`,
+          `第二團： ${renderMemberLine(state.members['2'])}`,
+          `第三團： ${renderMemberLine(state.members['3'])}`,
+        ].join('\n') || '無';
+      return j(res, 200, {
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: reply, flags: 64 }
+        data: { content: text, flags: 64, allowed_mentions: { parse: [] } },
       });
     }
 
-    // ---------- /leaveall ----------
-    if (name === 'leaveall') {
-      return res.status(200).json({
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: '請到開團訊息下方，對你所在的每團按下「離開」。這樣最安全、也能避免編輯衝突。', flags: 64 }
-      });
-    }
-  }
+    // join / leave
+    const m1 = cid.match(/^(join|leave)_(\d)$/);
+    if (m1) {
+      const act = m1[1];
+      const g = Number(m1[2]);
+      const uid = interaction.member?.user?.id || interaction.user?.id;
 
-  // Component interactions (buttons)
-  if (i.type === InteractionType.MESSAGE_COMPONENT) {
-    const customId = i.data?.custom_id;
-    const message  = i.message;
-    const userId   = i.member?.user?.id || i.user?.id;
-    const guildId  = i.guild_id;
+      let r;
+      if (act === 'join') r = tryJoin(state, uid, g);
+      else r = tryLeave(state, uid, g);
 
-    if (customId === 'view_all') {
-      const capsNow = parseCaps(message.content);
-      const members = getMembers(message.content, capsNow.length);
-      const parts = await Promise.all(capsNow.map(async (n, idx) => {
-        const ids = members[String(idx+1)] || [];
-        const title = `第${toHan(idx+1)}團名單（${ids.length} 人）`;
-        if (!ids.length || !guildId || !process.env.BOT_TOKEN) {
-          const list = ids.length ? ids.map(id => `<@${id}>`).join('、') : '（尚無成員）';
-          return `${title}\n${list}`;
-        }
-        const labels = await buildSortedLabelList(guildId, ids);
-        const list = labels.length ? labels.join('、') : '（尚無成員）';
-        return `${title}\n${list}`;
-      }));
-
-      return res.status(200).json({
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: parts.join('\n\n'), flags: 64, allowed_mentions: { parse: [] } }
-      });
-    }
-
-    // defer update
-    res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
-
-    // conflict mitigation: fetch latest message content with BOT_TOKEN if possible
-    let currentContent = message.content;
-    const msgId = getMsgId(message.content) || message.id;
-    if (process.env.BOT_TOKEN) {
-      const refreshed = await fetchMessage(i.channel_id, msgId);
-      if (refreshed?.content) currentContent = refreshed.content;
-    }
-
-    (async () => {
-      try {
-        const capsNow = parseCaps(currentContent);
-        const groupCount = capsNow.length;
-        let multi   = getMulti(currentContent);
-        let members = getMembers(currentContent, groupCount);
-        const title = getTitle(currentContent);
-
-        const m = customId.match(/^(join|leave)_(\d+)$/);
-        if (!m) return;
-        const action = m[1];
-        const idx    = parseInt(m[2], 10);
-
-        const myGroups = Object.entries(members).filter(([, arr]) => Array.isArray(arr) && arr.includes(userId)).map(([k]) => parseInt(k, 10));
-
-        async function ephemeral(msg) {
-          await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: msg, flags: 64, allowed_mentions: { parse: [] } })
-          });
-        }
-
-        if (action === 'join') {
-          if (!multi && myGroups.length > 0) { await ephemeral(`你已在第 ${myGroups.join(', ')} 團。`); return; }
-          if (capsNow[idx - 1] <= 0) { await ephemeral('該團已滿，無法加入。'); return; }
-          const arr = members[String(idx)];
-          if (!arr.includes(userId)) { arr.push(userId); capsNow[idx - 1] -= 1; }
-          else { await ephemeral('你已在該團中。'); return; }
-        }
-
-        if (action === 'leave') {
-          const arr = members[String(idx)];
-          const pos = arr.indexOf(userId);
-          if (pos === -1) { await ephemeral('你不在該團中。'); return; }
-          arr.splice(pos, 1); capsNow[idx - 1] += 1;
-        }
-
-        let newContent = buildContentFromCaps(capsNow);
-        if (title) newContent = `${title}\n\n${newContent}`;
-        newContent = setMulti(newContent, multi);
-        newContent = setMembers(newContent, members);
-        newContent = setTitle(newContent, title);
-        newContent = setMsgId(newContent, msgId);
-
-        // retry a couple of times
-        let ok = false;
-        for (let attempt = 0; attempt < 3 && !ok; attempt++) {
-          ok = await patchMessageWithWebhook(i.application_id, i.token, msgId, {
-            content: newContent,
-            components: buildComponents(capsNow),
-            allowed_mentions: { parse: [] }
-          });
-          if (!ok) await new Promise(r => setTimeout(r, 120));
-        }
-      } catch (e) {
-        console.error('component error', e);
+      if (!r.ok) {
+        return j(res, 200, {
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: r.msg, flags: 64 },
+        });
       }
-    })();
+      const { content: newContent, components: newComps } = rebuildMessage(
+        state,
+      );
+      return j(res, 200, {
+        type: InteractionResponseType.UPDATE_MESSAGE,
+        data: {
+          content: newContent,
+          components: newComps,
+          allowed_mentions: { parse: [] },
+        },
+      });
+    }
 
-    return;
+    // 管理：踢人（string select）
+    if (cid === 'admin_kick') {
+      const owner = state.owner;
+      const actor = interaction.member?.user?.id || interaction.user?.id;
+      if (actor !== owner) {
+        return j(res, 200, {
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: '只有開團者可操作。', flags: 64 },
+        });
+      }
+      const v = interaction.data?.values?.[0] || '';
+      const mm = v.match(/^kick:(\d+):([123])$/);
+      if (!mm) {
+        return j(res, 200, {
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: '格式錯誤。', flags: 64 },
+        });
+      }
+      const uid = mm[1];
+      const g = Number(mm[2]);
+      const r = tryKick(state, uid, g);
+      if (!r.ok) {
+        return j(res, 200, {
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: r.msg, flags: 64 },
+        });
+      }
+      const { content: newContent, components: newComps } = rebuildMessage(
+        state,
+      );
+      return j(res, 200, {
+        type: InteractionResponseType.UPDATE_MESSAGE,
+        data: {
+          content: newContent,
+          components: newComps,
+          allowed_mentions: { parse: [] },
+        },
+      });
+    }
+
+    // 管理：移組（string select）
+    if (cid === 'admin_move') {
+      const owner = state.owner;
+      const actor = interaction.member?.user?.id || interaction.user?.id;
+      if (actor !== owner) {
+        return j(res, 200, {
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: '只有開團者可操作。', flags: 64 },
+        });
+      }
+      const v = interaction.data?.values?.[0] || '';
+      const mm = v.match(/^move:(\d+):([123]):([123])$/);
+      if (!mm) {
+        return j(res, 200, {
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: '格式錯誤。', flags: 64 },
+        });
+      }
+      const uid = mm[1];
+      const from = Number(mm[2]);
+      const to = Number(mm[3]);
+      const r = tryMove(state, uid, from, to);
+      if (!r.ok) {
+        return j(res, 200, {
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: r.msg, flags: 64 },
+        });
+      }
+      const { content: newContent, components: newComps } = rebuildMessage(
+        state,
+      );
+      return j(res, 200, {
+        type: InteractionResponseType.UPDATE_MESSAGE,
+        data: {
+          content: newContent,
+          components: newComps,
+          allowed_mentions: { parse: [] },
+        },
+      });
+    }
+
+    // 其它元件
+    return j(res, 200, {
+      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: { content: '未支援的操作。', flags: 64 },
+    });
   }
 
-  // Fallback
-  return res.status(200).json({
+  // 其它互動
+  return j(res, 200, {
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-    data: { content: '未處理的互動類型。', flags: 64 }
+    data: { content: '未支援的互動。', flags: 64 },
   });
+}
+
+// ===== Handler (with verify-only gate) =====
+export default async function handler(req, res) {
+  // HEAD：必回 200
+  if (req.method === 'HEAD') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
+  // 簽章驗證
+  const sig = req.headers['x-signature-ed25519'];
+  const ts = req.headers['x-signature-timestamp'];
+  if (!sig || !ts) return res.status(401).send('missing signature headers');
+
+  const raw = await readRawBody(req);
+  let ok = false;
+  try {
+    ok = verifyKey(raw, sig, ts, process.env.PUBLIC_KEY);
+  } catch {
+    ok = false;
+  }
+  if (!ok) return res.status(401).send('invalid request signature');
+
+  const interaction = JSON.parse(raw);
+
+  // 驗證模式（預設開啟）
+  if (isVerifyOnly(req)) {
+    if (interaction.type === InteractionType.PING) {
+      return j(res, 200, { type: InteractionResponseType.PONG });
+    }
+    return j(res, 200, {
+      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: { content: 'OK（verify-only 模式）', flags: 64 },
+    });
+  }
+
+  // 完整功能
+  try {
+    return await fullAppHandler(interaction, req, res);
+  } catch (e) {
+    console.error('full handler error', e);
+    return j(res, 200, {
+      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: { content: 'Internal error', flags: 64 },
+    });
+  }
 }
