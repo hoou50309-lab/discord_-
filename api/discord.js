@@ -182,14 +182,17 @@ function buildMessageText(state) {
   return lines.join('\n');
 }
 
-function buildMainButtons(groupCount) {
+/** 把 /cteam 的 token 夾在 join/leave custom_id，之後互動可用 boot:<token> 取回初始 state */
+function buildMainButtons(state) {
+  const groupCount = state.caps.length;
+  const tag = state.token ? `:${state.token}` : '';
   const rows = [];
   for (let i = 1; i <= groupCount; i++) {
     rows.push({
       type: 1,
       components: [
-        { type: 2, style: 3, custom_id: `join_${i}`, label: `加入第${numToHan(i)}團` },
-        { type: 2, style: 2, custom_id: `leave_${i}`, label: `離開第${numToHan(i)}團` },
+        { type: 2, style: 3, custom_id: `join_${i}${tag}`,  label: `加入第${numToHan(i)}團` },
+        { type: 2, style: 2, custom_id: `leave_${i}${tag}`, label: `離開第${numToHan(i)}團` },
       ],
     });
   }
@@ -297,23 +300,22 @@ function hasAdmin(interaction, state) {
  * ========================= */
 export default async function handler(req, res) {
   if (req.method === 'HEAD') {
-	if (VERIFY_SIGNATURE) {
-		const signature = req.headers['x-signature-ed25519'];
-		const timestamp = req.headers['x-signature-timestamp'];
-		// HEAD 沒有 body，用空字串驗簽；缺簽或驗簽失敗都要回 401
-	  if (!signature || !timestamp) {
+    if (VERIFY_SIGNATURE) {
+      const signature = req.headers['x-signature-ed25519'];
+      const timestamp = req.headers['x-signature-timestamp'];
+      if (!signature || !timestamp) {
         return res.status(401).send('missing signature');
       }
       try {
-         const ok = verifyKey('', signature, timestamp, PUBLIC_KEY);
-         if (!ok) return res.status(401).send('invalid request signature');
-	  } catch {
-		return res.status(401).send('invalid request signature');
-	 }
-	}
-	return res.status(200).end();
-   }
-   
+        const ok = verifyKey('', signature, timestamp, PUBLIC_KEY);
+        if (!ok) return res.status(401).send('invalid request signature');
+      } catch {
+        return res.status(401).send('invalid request signature');
+      }
+    }
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   const signature = req.headers['x-signature-ed25519'];
@@ -342,7 +344,7 @@ export default async function handler(req, res) {
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
     const title = getOpt(opts, 'title') || '';
-    const defaults = getOpt(opts, 'defaults') || ''; // ★ 修正
+    const defaults = getOpt(opts, 'defaults') || '';
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
     const initState = buildInitialState({
@@ -357,7 +359,7 @@ export default async function handler(req, res) {
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
       data: {
         content: buildMessageText(initState),
-        components: buildMainButtons(caps.length),
+        components: buildMainButtons(initState),
         allowed_mentions: { parse: [] },
       },
     });
@@ -370,19 +372,26 @@ export default async function handler(req, res) {
     const message = interaction.message;
     const messageId = message?.id;
 
-    // 解析 custom_id 末段的原文 messageId（避免 .at 相容性問題）
+    // admin 面板的 custom_id 最後一段是原文 messageId
     const msgIdFromCid = customId.startsWith('admin_manage:')
-      ? customId.split(':').slice(-1)[0] // ★ 修正
+      ? customId.split(':').slice(-1)[0]
       : null;
     const targetMessageId = msgIdFromCid || messageId;
 
-    // 先準備 state
+    // join/leave 的 custom_id 最後一段夾的是 /cteam 的 token
+    const joinLeaveBootToken =
+      (customId.startsWith('join_') || customId.startsWith('leave_'))
+        ? (customId.split(':').slice(1).join(':') || null)
+        : null;
+
+    // 先準備 state（優先用 boot:<token> 讀到 /cteam 初始狀態，確保 multi 等旗標正確）
     let baseState =
         await loadStateById(targetMessageId)
+     || (joinLeaveBootToken ? await kvGet(`boot:${joinLeaveBootToken}`) : null)
      || await kvGet(`boot:${interaction.token}`)
      || fallbackStateFromContent(message?.content || '');
     baseState.messageId = targetMessageId;
-    if (!baseState.token) baseState.token = interaction.token;
+    if (!baseState.token) baseState.token = joinLeaveBootToken || interaction.token;
 
     // 直接回 ephemeral（避免重複）
     if (customId === 'admin_open') {
@@ -439,7 +448,8 @@ export default async function handler(req, res) {
           (async () => {
             let state = { ...baseState };
 
-            const jm = customId.match(/^(join|leave)_(\d+)$/);
+            const head = customId.split(':')[0];
+            const jm = head.match(/^(join|leave)_(\d+)$/);
             if (!jm) return null;
 
             const action = jm[1];
@@ -480,7 +490,7 @@ export default async function handler(req, res) {
               kind: 'update',
               data: {
                 content: buildMessageText(baseState),
-                components: buildMainButtons(baseState.caps.length),
+                components: buildMainButtons(baseState),
                 allowed_mentions: { parse: [] },
               }
             };
@@ -512,10 +522,11 @@ export default async function handler(req, res) {
       try {
         let state =
             await loadStateById(targetMessageId)
+         || (joinLeaveBootToken ? await kvGet(`boot:${joinLeaveBootToken}`) : null)
          || await kvGet(`boot:${interaction.token}`)
          || fallbackStateFromContent(message?.content || '');
         state.messageId = targetMessageId;
-        if (!state.token) state.token = interaction.token;
+        if (!state.token) state.token = joinLeaveBootToken || interaction.token;
 
         const cid = customId;
 
@@ -570,7 +581,8 @@ export default async function handler(req, res) {
           return;
         }
 
-        const m = cid.match(/^(join|leave)_(\d+)$/);
+        const head = cid.split(':')[0];
+        const m = head.match(/^(join|leave)_(\d+)$/);
         if (m) {
           const action = m[1];
           const idx = parseInt(m[2], 10);
@@ -636,7 +648,7 @@ export default async function handler(req, res) {
  * ========================= */
 async function patchOriginal(interaction, state) {
   const newContent = buildMessageText(state);
-  const newComponents = buildMainButtons(state.caps.length);
+  const newComponents = buildMainButtons(state);
 
   const token = state.token || interaction.token;
   const msgId = state.messageId;
