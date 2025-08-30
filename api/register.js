@@ -1,5 +1,4 @@
 // scripts/register-commands.mjs
-import fetch from "node-fetch";
 
 const APP_ID = process.env.APP_ID;
 const BOT_TOKEN = process.env.BOT_TOKEN;
