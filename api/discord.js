@@ -1,6 +1,6 @@
 // api/discord.js
 // 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定（修正從 ephemeral 觸發時無法更新原文）
-// - /cteam 同步回覆（type:4）；若需要讀取 defaults 附件，改走 deferred（type:5）再 PATCH @original
+// - /cteam 同步回覆（type:4）
 // - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
 // - admin_open / admin_manage:pickmove 直接回覆 ephemeral（type:4, flags:64）避免重複
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
@@ -117,33 +117,17 @@ async function withLock(lockKey, ttlSec, fn) {
  * /cteam 預設名單附件：讀取工具
  * ========================= */
 const DEFAULTS_FILE_HINT = '預設人員名單';
-
-// 只判斷是否帶到附件（不抓取），用來決定是否先回 defer
-function hasDefaultsAttachment(interaction, optionName = 'defaults') {
-  try {
-    const opts = interaction.data?.options || [];
-    const resolvedAtt = interaction.data?.resolved?.attachments || {};
-    if (!resolvedAtt || Object.keys(resolvedAtt).length === 0) return false;
-    const opt = opts.find(o => o.name === optionName);
-    if (opt && resolvedAtt[opt.value]) return true; // 明確用 Attachment option
-    for (const k in resolvedAtt) {
-      const a = resolvedAtt[k];
-      const fname = String(a?.filename || a?.name || '');
-      if (fname.includes(DEFAULTS_FILE_HINT)) return true;
-    }
-    return false;
-  } catch { return false; }
-}
-
 // 讀取 /cteam 的附件（option: defaults 或檔名含「預設人員名單」），回傳文字，失敗回 null
 async function loadDefaultsFromAttachment(interaction, optionName = 'defaults') {
   try {
     const opts = interaction.data?.options || [];
     const resolvedAtt = interaction.data?.resolved?.attachments || {};
 
+    // 若 defaults 是 Attachment 選項（type=11），value 會是附件 id
     const opt = opts.find(o => o.name === optionName);
     let att = (opt && resolvedAtt[opt.value]) ? resolvedAtt[opt.value] : null;
 
+    // 若沒有直接指定，從 resolved.attachments 中找檔名包含關鍵字的
     if (!att) {
       for (const k in resolvedAtt) {
         const a = resolvedAtt[k];
@@ -397,7 +381,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ type: InteractionResponseType.PONG });
   }
 
-  // /cteam：同步回覆（有附件則先 defer 再補上）
+  // /cteam：同步回覆
   if (interaction.type === InteractionType.APPLICATION_COMMAND &&
       interaction.data?.name === 'cteam') {
 
@@ -406,38 +390,8 @@ export default async function handler(req, res) {
     const multi = !!getOpt(opts, 'multi');
     const title = getOpt(opts, 'title') || '';
 
-    const attachmentIncoming = hasDefaultsAttachment(interaction, 'defaults');
-
-    // 有附件 → 立即 defer，等待抓附件完成再 PATCH @original
-    if (attachmentIncoming) {
-      res.status(200).json({
-        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-      });
-
-      (async () => {
-        let defaults = getOpt(opts, 'defaults') || '';
-        const attachTxt = await loadDefaultsFromAttachment(interaction, 'defaults');
-        if (attachTxt) defaults = attachTxt;
-
-        const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
-
-        const initState = buildInitialState({
-          title, caps, multi, defaults,
-          messageId: null,
-          ownerId,
-          token: interaction.token,
-        });
-
-        await kvSet(`boot:${interaction.token}`, initState, 3600);
-        await patchOriginalFromDeferred(interaction, initState); // 會回寫 messageId 並存 state
-      })();
-
-      return; // 已回 defer
-    }
-
-    // 沒有附件 → 走原本同步回覆（type:4）
+    // 文字 defaults + 嘗試讀附件，附件成功則覆蓋
     let defaults = getOpt(opts, 'defaults') || '';
-    // 就算沒有附件，這個函式很快（會回 null）
     const attachTxt = await loadDefaultsFromAttachment(interaction, 'defaults');
     if (attachTxt) defaults = attachTxt;
 
@@ -763,38 +717,6 @@ async function patchOriginal(interaction, state) {
     const text = await r.text();
     console.error('patch failed', r.status, text);
     await followupEphemeral(interaction, '系統忙碌，請稍後再試（已收到你的操作）。');
-  }
-}
-
-/* === /cteam defer 後：PATCH @original，並回存 messageId === */
-async function patchOriginalFromDeferred(interaction, state) {
-  const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`;
-  try {
-    const r = await fetch(url, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        content: buildMessageText(state),
-        components: buildMainButtons(state),
-        allowed_mentions: { parse: [] },
-      }),
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      console.error('patch @original failed', r.status, t);
-      await followupEphemeral(interaction, '建立名單失敗，請再試一次。');
-      return;
-    }
-    // 取得訊息 id，之後互動就能用 messageId 直接載入 state
-    const msg = await r.json().catch(() => null);
-    const mid = msg?.id;
-    if (mid) {
-      state.messageId = mid;
-      await saveStateById(mid, state);
-    }
-  } catch (e) {
-    console.error('patchOriginalFromDeferred error', e);
-    await followupEphemeral(interaction, '建立名單失敗，請再試一次。');
   }
 }
 
