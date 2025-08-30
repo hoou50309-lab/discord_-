@@ -15,6 +15,38 @@ import {
 
 export const config = { runtime: "nodejs" };
 
+export default async function handler(req, res) {
+  // ❶ 只接受 POST。包含 HEAD/GET/OPTIONS 在內都回 405
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
+  }
+
+  // ❷ 必須帶簽章與時間戳
+  const sig = req.headers["x-signature-ed25519"];
+  const ts  = req.headers["x-signature-timestamp"];
+  if (!sig || !ts) {
+    return res.status(401).send("missing signature headers");
+  }
+
+  // ❸ 讀 raw body 後驗簽；錯誤一律 401
+  const raw = await readRawBody(req);
+  let ok = false;
+  try {
+    ok = verifyKey(raw, sig, ts, process.env.PUBLIC_KEY);
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    return res.status(401).send("invalid request signature");
+  }
+
+  // ❹ 通過驗簽，才 parse 與處理互動
+  const i = JSON.parse(raw);
+
+  // ...你原本的 PING / 指令 / 按鈕 / MODAL 處理邏輯...
+}
+
+
 /* ============== small utils ============== */
 async function readRawBody(req) {
   const chunks = [];
