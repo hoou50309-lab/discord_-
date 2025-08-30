@@ -11,11 +11,6 @@ const COMMANDS = [
     ]
   },
   {
-    name: "myteams",
-    description: "查詢我在指定開團訊息的所屬團",
-    options: [{ type: 3, name: "message_id", description: "目標訊息 ID", required: false }]
-  },
-  {
     name: "leaveall",
     description: "安全離團指引（避免跨訊息編輯）",
     options: [{ type: 3, name: "message_id", description: "目標訊息 ID", required: false }]
