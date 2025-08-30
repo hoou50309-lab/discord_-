@@ -1,12 +1,3 @@
-// api/discord.js
-// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定（修正從 ephemeral 觸發時無法更新原文）
-// - /cteam 同步回覆（type:4）
-// - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
-// - admin_open / admin_manage:pickmove 直接回覆 ephemeral（type:4, flags:64）避免重複
-// - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
-// - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
-// - /cteam defaults 可讀取「預設人員名單」附件（Attachment），若有附件則覆蓋文字值
-
 import {
   InteractionType,
   InteractionResponseType,
@@ -17,7 +8,7 @@ import {
  * 環境與開關
  * ========================= */
 const _resolvedVerify =
-  (process.env.VERIFY_SIGNATURE ?? 
+  (process.env.VERIFY_SIGNATURE ??
    ((process.env.VERCEL === '1' ||
      process.env.VERCEL_ENV === 'production' ||
      process.env.NODE_ENV === 'production')
@@ -119,17 +110,14 @@ async function withLock(lockKey, ttlSec, fn) {
  * /cteam 預設名單附件：讀取工具
  * ========================= */
 const DEFAULTS_FILE_HINT = '預設人員名單';
-// 讀取 /cteam 的附件（option: defaults 或檔名含「預設人員名單」），回傳文字，失敗回 null
 async function loadDefaultsFromAttachment(interaction, optionName = 'defaults') {
   try {
     const opts = interaction.data?.options || [];
     const resolvedAtt = interaction.data?.resolved?.attachments || {};
 
-    // 若 defaults 是 Attachment 選項（type=11），value 會是附件 id
     const opt = opts.find(o => o.name === optionName);
     let att = (opt && resolvedAtt[opt.value]) ? resolvedAtt[opt.value] : null;
 
-    // 若沒有直接指定，從 resolved.attachments 中找檔名包含關鍵字的
     if (!att) {
       for (const k in resolvedAtt) {
         const a = resolvedAtt[k];
@@ -163,16 +151,45 @@ async function loadDefaultsFromAttachment(interaction, optionName = 'defaults') 
  * /cteam 參數處理
  * ========================= */
 function getOpt(opts, name) { return opts?.find(o => o.name === name)?.value; }
-
-// 解析 caps 參數
 function parseCaps(opts) {
   const raw = getOpt(opts, 'caps');
-  if (!raw) return [12, 12, 12]; // 如果沒有指定 caps，則預設每個團隊12個名額
+  if (!raw) return [12, 12, 12];
   const arr = String(raw)
     .split(',')
     .map(s => parseInt(s.trim(), 10))
-    .filter(n => Number.isInteger(n) && n >= 0); // 過濾掉非正整數的值
-  return arr.length ? arr : [12, 12, 12]; // 如果無效的 caps，則返回預設值
+    .filter(n => Number.isInteger(n) && n >= 0);
+  return arr.length ? arr : [12, 12, 12];
+}
+
+/* =========================
+ * /cteam 初始狀態構建
+ * ========================= */
+function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, token }) {
+  const groups = caps.length;
+  const members = {};
+  for (let i = 1; i <= groups; i++) members[String(i)] = [];
+  if (defaults) {
+    const lines = String(defaults).split('\n');
+    for (const line of lines) {
+      const m = line.match(/^\s*(\d+)\s*:\s*(.*)$/);
+      if (!m) continue;
+      const idx = parseInt(m[1], 10);
+      if (!members[String(idx)]) continue;
+      const ids = Array.from(m[2].matchAll(/<@!?(\d+)>/g)).map(x => x[1]);
+      for (const id of ids) {
+        if (caps[idx - 1] > 0) { members[String(idx)].push(id); caps[idx - 1] -= 1; }
+      }
+    }
+  }
+  return {
+    title: title || '',
+    caps,
+    members,
+    multi: !!multi,
+    messageId: messageId || null,
+    ownerId: ownerId || '',
+    token: token || null,
+  };
 }
 
 /* =========================
@@ -225,13 +242,12 @@ export default async function handler(req, res) {
     const multi = !!getOpt(opts, 'multi');
     const title = getOpt(opts, 'title') || '';
 
-    // 檢查附件是否存在，若有附件則載入並使用該附件內容填充 defaults
     let defaults = '';
     const attachTxt = await loadDefaultsFromAttachment(interaction, 'defaults');
     if (attachTxt) {
-      defaults = attachTxt;  // 使用附件的內容覆蓋 defaults
+      defaults = attachTxt;
     } else {
-      defaults = getOpt(opts, 'defaults') || '';  // 若無附件，則使用指令中的 defaults 參數（若有）
+      defaults = getOpt(opts, 'defaults') || '';
     }
 
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
