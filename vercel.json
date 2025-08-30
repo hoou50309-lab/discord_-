@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/discord.js": {
-      "runtime": "nodejs"
+      "maxDuration": 10
     }
   },
   "crons": [
