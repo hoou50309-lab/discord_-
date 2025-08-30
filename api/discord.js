@@ -4,7 +4,7 @@
 // - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
 // - admin_open / admin_manage:pickmove 直接回覆 ephemeral（type:4, flags:64）避免重複
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
-// - VERIFY_SIGNATURE 預設關，過審時設為 true
+// - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
 
 import {
   InteractionType,
@@ -15,7 +15,16 @@ import {
 /* =========================
  * 環境與開關
  * ========================= */
-const VERIFY_SIGNATURE = (process.env.VERIFY_SIGNATURE || 'false').toLowerCase() === 'true';
+// 自動依環境切換：若未手動設定 VERIFY_SIGNATURE，Production 預設開啟，非 Production 預設關閉
+const _resolvedVerify =
+  (process.env.VERIFY_SIGNATURE ??
+   ((process.env.VERCEL === '1' ||
+     process.env.VERCEL_ENV === 'production' ||
+     process.env.NODE_ENV === 'production')
+     ? 'true'
+     : 'false'));
+const VERIFY_SIGNATURE = String(_resolvedVerify).toLowerCase() === 'true';
+
 const PUBLIC_KEY = process.env.PUBLIC_KEY || '';
 
 const APP_ID = process.env.APP_ID || '';
@@ -434,7 +443,6 @@ export default async function handler(req, res) {
           });
         }
       } catch (e) {
-        // 若是我們丟出的 EPH:* 訊息，直接回 ephemeral
         const msg = String(e?.message || '');
         if (msg.startsWith('EPH:')) {
           return res.status(200).json({
@@ -442,7 +450,6 @@ export default async function handler(req, res) {
             data: { content: msg.slice(4), flags: 64, allowed_mentions: { parse: [] } }
           });
         }
-        // 其他錯誤則落到保險路徑
       }
     }
 
