@@ -1,8 +1,8 @@
 // api/discord.js
-// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定（修正從 ephemeral 觸發時無法更新原文）
+// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定 + Bot Token 後援
 // - /cteam 同步回覆（type:4）
 // - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
-// - admin_open / admin_manage:pickmove 直接回覆 ephemeral（type:4, flags:64）避免重複
+// - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
 
@@ -123,7 +123,7 @@ async function withLock(lockKey, ttlSec, fn) {
  *   multi: boolean,
  *   messageId: string|null,
  *   ownerId: string,
- *   token: string|null
+ *   token: string|null          // /cteam 當下的 webhook token（用於編輯原文）
  * }
  */
 function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, token }) {
@@ -182,17 +182,17 @@ function buildMessageText(state) {
   return lines.join('\n');
 }
 
-/** 把 /cteam 的 token 夾在 join/leave custom_id，之後互動可用 boot:<token> 取回初始 state */
+// 改為吃 state（把 multi 編進 join 的 custom_id，防止 fallback 遺失設定）
 function buildMainButtons(state) {
   const groupCount = state.caps.length;
-  const tag = state.token ? `:${state.token}` : '';
+  const multiFlag = state.multi ? '1' : '0';
   const rows = [];
   for (let i = 1; i <= groupCount; i++) {
     rows.push({
       type: 1,
       components: [
-        { type: 2, style: 3, custom_id: `join_${i}${tag}`,  label: `加入第${numToHan(i)}團` },
-        { type: 2, style: 2, custom_id: `leave_${i}${tag}`, label: `離開第${numToHan(i)}團` },
+        { type: 2, style: 3, custom_id: `join_${i}__m${multiFlag}`, label: `加入第${numToHan(i)}團` },
+        { type: 2, style: 2, custom_id: `leave_${i}`, label: `離開第${numToHan(i)}團` },
       ],
     });
   }
@@ -203,7 +203,6 @@ function buildMainButtons(state) {
   return rows;
 }
 
-/* === 管理面板 custom_id 夾帶原文 messageId === */
 function buildAdminPanelSelects(state) {
   const targetMid = state.messageId || '';
   const optionsKick = [];
@@ -251,7 +250,6 @@ function buildAdminPanelSelects(state) {
   return components;
 }
 
-/* === 第二步目的團 custom_id 也帶 messageId === */
 function buildMoveToSelect(state, userId, fromIdx) {
   const targetMid = state.messageId || '';
   const options = [];
@@ -303,15 +301,11 @@ export default async function handler(req, res) {
     if (VERIFY_SIGNATURE) {
       const signature = req.headers['x-signature-ed25519'];
       const timestamp = req.headers['x-signature-timestamp'];
-      if (!signature || !timestamp) {
-        return res.status(401).send('missing signature');
-      }
+      if (!signature || !timestamp) return res.status(401).send('missing signature');
       try {
         const ok = verifyKey('', signature, timestamp, PUBLIC_KEY);
         if (!ok) return res.status(401).send('invalid request signature');
-      } catch {
-        return res.status(401).send('invalid request signature');
-      }
+      } catch { return res.status(401).send('invalid request signature'); }
     }
     return res.status(200).end();
   }
@@ -371,29 +365,24 @@ export default async function handler(req, res) {
     const userId = interaction.member?.user?.id || interaction.user?.id;
     const message = interaction.message;
     const messageId = message?.id;
+    const channelId = message?.channel_id;
 
-    // admin 面板的 custom_id 最後一段是原文 messageId
+    // 解析 custom_id 裡面的原文 messageId（admin 面板）
     const msgIdFromCid = customId.startsWith('admin_manage:')
       ? customId.split(':').slice(-1)[0]
       : null;
     const targetMessageId = msgIdFromCid || messageId;
 
-    // join/leave 的 custom_id 最後一段夾的是 /cteam 的 token
-    const joinLeaveBootToken =
-      (customId.startsWith('join_') || customId.startsWith('leave_'))
-        ? (customId.split(':').slice(1).join(':') || null)
-        : null;
-
-    // 先準備 state（優先用 boot:<token> 讀到 /cteam 初始狀態，確保 multi 等旗標正確）
+    // 先準備 state
     let baseState =
         await loadStateById(targetMessageId)
-     || (joinLeaveBootToken ? await kvGet(`boot:${joinLeaveBootToken}`) : null)
-     || await kvGet(`boot:${interaction.token}`)
+     || await kvGet(`boot:${interaction.token}`) // 只有極早期第一下才可能命中
      || fallbackStateFromContent(message?.content || '');
     baseState.messageId = targetMessageId;
-    if (!baseState.token) baseState.token = joinLeaveBootToken || interaction.token;
+    // 千萬不要用「這次互動的 token」覆蓋（ephemeral 會錯），保留既有 token
+    // if (!baseState.token) baseState.token = interaction.token;  // ← 刻意拿掉
 
-    // 直接回 ephemeral（避免重複）
+    // === 管理面板：開啟 & 選人（直接 type:4 回 ephemeral）===
     if (customId === 'admin_open') {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
@@ -401,6 +390,8 @@ export default async function handler(req, res) {
           data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
         });
       }
+      // 確保後續選單上有 messageId
+      baseState.messageId = targetMessageId;
       return res.status(200).json({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
         data: {
@@ -441,19 +432,84 @@ export default async function handler(req, res) {
       });
     }
 
-    // 快速路徑：join/leave
+    // === 管理面板：真正執行（同步處理，直接回 ephemeral 成功訊息）===
+    if (customId.startsWith('admin_manage:kick:') || customId.startsWith('admin_manage:to:')) {
+      if (!hasAdmin(interaction, baseState)) {
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
+        });
+      }
+
+      try {
+        await withLock(`msg:${targetMessageId}`, 5, async () => {
+          if (customId.startsWith('admin_manage:kick:')) {
+            const v = interaction.data.values?.[0] || '';
+            const m = v.match(/^kick:(\d+):(\d+)$/);
+            if (!m) throw new Error('無效的選項');
+            const g = parseInt(m[1], 10);
+            const kickId = m[2];
+
+            const arr = baseState.members[String(g)] || [];
+            const pos = arr.indexOf(kickId);
+            if (pos === -1) throw new Error('成員不在該團。');
+            arr.splice(pos, 1);
+            baseState.caps[g - 1] += 1;
+
+            await saveStateById(targetMessageId, baseState);
+            await patchOriginal(interaction, baseState, channelId);
+            return res.status(200).json({
+              type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+              data: { content: `已將 <@${kickId}> 踢出第${numToHan(g)}團。`, flags: 64, allowed_mentions: { parse: [] } }
+            });
+          }
+
+          // admin_manage:to:{uid}:{from}:{msgId}
+          const seg = customId.split(':');
+          const moveId = seg[2];
+          const fromIdx = parseInt(seg[3], 10);
+          const toIdx = parseInt(interaction.data.values?.[0] || '0', 10);
+          if (!toIdx || toIdx === fromIdx) throw new Error('無效的目的團。');
+          if (baseState.caps[toIdx - 1] <= 0) throw new Error(`第${numToHan(toIdx)}團名額已滿。`);
+
+          const fromArr = baseState.members[String(fromIdx)] || [];
+          const pos = fromArr.indexOf(moveId);
+          if (pos === -1) throw new Error('該成員已不在原團。');
+
+          fromArr.splice(pos, 1);
+          baseState.caps[fromIdx - 1] += 1;
+          const toArr = baseState.members[String(toIdx)] || [];
+          if (!toArr.includes(moveId)) { toArr.push(moveId); baseState.caps[toIdx - 1] -= 1; }
+
+          await saveStateById(targetMessageId, baseState);
+          await patchOriginal(interaction, baseState, channelId);
+          return res.status(200).json({
+            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+            data: { content: `已將 <@${moveId}> 從第${numToHan(fromIdx)}團移至第${numToHan(toIdx)}團。`, flags: 64, allowed_mentions: { parse: [] } }
+          });
+        });
+      } catch (e) {
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: `處理失敗：${String(e?.message || '未知錯誤')}`, flags: 64 }
+        });
+      }
+      return; // 理論到不了這
+    }
+
+    // === 快速路徑：join/leave 嘗試在同次請求內完成並 UPDATE_MESSAGE ===
     if (FAST_UPDATE) {
       try {
         const quick = await Promise.race([
           (async () => {
             let state = { ...baseState };
 
-            const head = customId.split(':')[0];
-            const jm = head.match(/^(join|leave)_(\d+)$/);
+            const jm = customId.match(/^(join|leave)_(\d+)(?:__m([01]))?$/);
             if (!jm) return null;
 
             const action = jm[1];
             const idx = parseInt(jm[2], 10);
+            if (jm[3] === '0' || jm[3] === '1') state.multi = jm[3] === '1';
 
             await withLock(`msg:${targetMessageId}`, LOCK_TTL_SEC, async () => {
               const myGroups = Object.entries(state.members)
@@ -482,6 +538,8 @@ export default async function handler(req, res) {
                 state.caps[idx - 1] += 1;
               }
 
+              // 第一次互動就把狀態跟 token 綁定在 messageId（若之前沒存過）
+              if (!state.token) state.token = baseState.token || null;
               await saveStateById(targetMessageId, state);
               baseState = state;
             });
@@ -515,118 +573,50 @@ export default async function handler(req, res) {
       }
     }
 
-    // 保險路徑
+    // === 保險路徑（join/leave）===
     res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
 
     (async () => {
       try {
         let state =
             await loadStateById(targetMessageId)
-         || (joinLeaveBootToken ? await kvGet(`boot:${joinLeaveBootToken}`) : null)
          || await kvGet(`boot:${interaction.token}`)
          || fallbackStateFromContent(message?.content || '');
         state.messageId = targetMessageId;
-        if (!state.token) state.token = joinLeaveBootToken || interaction.token;
 
-        const cid = customId;
+        const m = customId.match(/^(join|leave)_(\d+)(?:__m([01]))?$/);
+        if (!m) return;
 
-        if (cid.startsWith('admin_manage:')) {
-          if (!hasAdmin(interaction, state)) {
-            await followupEphemeral(interaction, '只有開團者或伺服器管理員可以使用管理功能。');
-            return;
+        const action = m[1];
+        const idx = parseInt(m[2], 10);
+        if (m[3] === '0' || m[3] === '1') state.multi = m[3] === '1';
+
+        await withLock(`msg:${targetMessageId}`, 4, async () => {
+          const myGroups = Object.entries(state.members)
+            .filter(([, arr]) => Array.isArray(arr) && arr.includes(userId))
+            .map(([k]) => parseInt(k, 10));
+
+          if (action === 'join') {
+            if (!state.multi && myGroups.length > 0 && !myGroups.includes(idx)) {
+              await followupEphemeral(interaction, '你已加入其他團，未開啟「允許多團」。'); return;
+            }
+            if (state.caps[idx - 1] <= 0) {
+              await followupEphemeral(interaction, `第${numToHan(idx)}團名額已滿。`); return;
+            }
+            const arr = state.members[String(idx)];
+            if (!arr.includes(userId)) { arr.push(userId); state.caps[idx - 1] -= 1; }
+            else { await followupEphemeral(interaction, `你已在第${numToHan(idx)}團。`); return; }
+          } else {
+            const arr = state.members[String(idx)];
+            const pos = arr.indexOf(userId);
+            if (pos === -1) { await followupEphemeral(interaction, `你不在第${numToHan(idx)}團。`); return; }
+            arr.splice(pos, 1);
+            state.caps[idx - 1] += 1;
           }
 
-          await withLock(`msg:${targetMessageId}`, 5, async () => {
-            if (cid.startsWith('admin_manage:kick:')) {
-              const v = interaction.data.values?.[0] || '';
-              const m = v.match(/^kick:(\d+):(\d+)$/);
-              if (!m) return;
-              const g = parseInt(m[1], 10);
-              const kickId = m[2];
-              const arr = state.members[String(g)] || [];
-              const pos = arr.indexOf(kickId);
-              if (pos === -1) { await followupEphemeral(interaction, '成員不在該團。'); return; }
-              arr.splice(pos, 1);
-              state.caps[g - 1] += 1;
-
-              await saveStateById(targetMessageId, state);
-              await patchOriginal(interaction, state);
-              await followupEphemeral(interaction, `已將 <@${kickId}> 踢出第${numToHan(g)}團。`);
-              return;
-            }
-
-            if (cid.startsWith('admin_manage:to:')) {
-              const seg = cid.split(':'); // admin_manage:to:{uid}:{from}:{msgId}
-              const moveId = seg[2];
-              const fromIdx = parseInt(seg[3], 10);
-              const toIdx = parseInt(interaction.data.values?.[0] || '0', 10);
-              if (!toIdx || toIdx === fromIdx) { await followupEphemeral(interaction, '無效的目的團。'); return; }
-              if (state.caps[toIdx - 1] <= 0) { await followupEphemeral(interaction, `第${numToHan(toIdx)}團名額已滿。`); return; }
-
-              const fromArr = state.members[String(fromIdx)] || [];
-              const pos = fromArr.indexOf(moveId);
-              if (pos === -1) { await followupEphemeral(interaction, '該成員已不在原團。'); return; }
-
-              fromArr.splice(pos, 1);
-              state.caps[fromIdx - 1] += 1;
-              const toArr = state.members[String(toIdx)] || [];
-              if (!toArr.includes(moveId)) { toArr.push(moveId); state.caps[toIdx - 1] -= 1; }
-
-              await saveStateById(targetMessageId, state);
-              await patchOriginal(interaction, state);
-              await followupEphemeral(interaction, `已將 <@${moveId}> 從第${numToHan(fromIdx)}團移至第${numToHan(toIdx)}團。`);
-              return;
-            }
-          });
-          return;
-        }
-
-        const head = cid.split(':')[0];
-        const m = head.match(/^(join|leave)_(\d+)$/);
-        if (m) {
-          const action = m[1];
-          const idx = parseInt(m[2], 10);
-
-          await withLock(`msg:${targetMessageId}`, 4, async () => {
-            const myGroups = Object.entries(state.members)
-              .filter(([, arr]) => Array.isArray(arr) && arr.includes(userId))
-              .map(([k]) => parseInt(k, 10));
-
-            if (action === 'join') {
-              if (!state.multi && myGroups.length > 0 && !myGroups.includes(idx)) {
-                await followupEphemeral(interaction, '你已加入其他團，未開啟「允許多團」。');
-                return;
-              }
-              if (state.caps[idx - 1] <= 0) {
-                await followupEphemeral(interaction, `第${numToHan(idx)}團名額已滿。`);
-                return;
-              }
-              const arr = state.members[String(idx)];
-              if (!arr.includes(userId)) {
-                arr.push(userId);
-                state.caps[idx - 1] -= 1;
-              } else {
-                await followupEphemeral(interaction, `你已在第${numToHan(idx)}團。`);
-                return;
-              }
-            } else {
-              const arr = state.members[String(idx)];
-              const pos = arr.indexOf(userId);
-              if (pos === -1) {
-                await followupEphemeral(interaction, `你不在第${numToHan(idx)}團。`);
-                return;
-              }
-              arr.splice(pos, 1);
-              state.caps[idx - 1] += 1;
-            }
-
-            await saveStateById(targetMessageId, state);
-            await patchOriginal(interaction, state);
-          });
-
-          return;
-        }
-
+          await saveStateById(targetMessageId, state);
+          await patchOriginal(interaction, state, channelId);
+        });
       } catch (e) {
         console.error('component error', e);
         await followupEphemeral(interaction, '處理時發生錯誤，請再試一次。');
@@ -644,30 +634,51 @@ export default async function handler(req, res) {
 }
 
 /* =========================
- * PATCH 原訊息（共用）
+ * PATCH 原訊息（共用，含 Bot Token 後援）
  * ========================= */
-async function patchOriginal(interaction, state) {
+async function patchOriginal(interaction, state, channelId) {
   const newContent = buildMessageText(state);
   const newComponents = buildMainButtons(state);
 
-  const token = state.token || interaction.token;
-  const msgId = state.messageId;
-  const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${token}/messages/${msgId}`;
-
-  const r = await fetch(url, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      content: newContent,
-      components: newComponents,
-      allowed_mentions: { parse: [] },
-    }),
-  });
-  if (!r.ok) {
-    const text = await r.text();
-    console.error('patch failed', r.status, text);
-    await followupEphemeral(interaction, '系統忙碌，請稍後再試（已收到你的操作）。');
+  // 先嘗試 webhook token（最理想）
+  if (state.token) {
+    const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${state.token}/messages/${state.messageId}`;
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: newContent,
+        components: newComponents,
+        allowed_mentions: { parse: [] },
+      }),
+    });
+    if (r.ok) return;
+    // 失敗則繼續用 BOT_TOKEN 後援
+    console.warn('webhook patch failed', r.status, await r.text());
   }
+
+  // 後援：用 Bot Token 改頻道訊息（只要是自己機器人發的就能改）
+  if (BOT_TOKEN && channelId) {
+    const url2 = `https://discord.com/api/v10/channels/${channelId}/messages/${state.messageId}`;
+    const r2 = await fetch(url2, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bot ${BOT_TOKEN}`,
+      },
+      body: JSON.stringify({
+        content: newContent,
+        components: newComponents,
+        allowed_mentions: { parse: [] },
+      }),
+    });
+    if (r2.ok) return;
+    console.error('bot patch failed', r2.status, await r2.text());
+  } else {
+    console.error('bot patch skipped: missing BOT_TOKEN or channelId');
+  }
+
+  await followupEphemeral(interaction, '系統忙碌，請稍後再試（已收到你的操作）。');
 }
 
 /* =========================
@@ -717,6 +728,7 @@ function fallbackStateFromContent(content) {
     caps.push(12,12,12);
     members["1"] = []; members["2"] = []; members["3"] = [];
   }
+  // 注意：這裡 multi 無法從文字還原，之後會靠 join custom_id 補回來
   return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null };
 }
 
