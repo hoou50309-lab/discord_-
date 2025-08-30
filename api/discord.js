@@ -7,11 +7,7 @@
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
 // - /cteam defaults 可讀取「預設人員名單」附件（Attachment），若有附件則覆蓋文字值
 
-import {
-  InteractionType,
-  InteractionResponseType,
-  verifyKey,
-} from 'discord-interactions';
+import { InteractionType, InteractionResponseType, verifyKey } from 'discord-interactions';
 
 /* =========================
  * 環境與開關
@@ -26,7 +22,6 @@ const _resolvedVerify =
 const VERIFY_SIGNATURE = String(_resolvedVerify).toLowerCase() === 'true';
 
 const PUBLIC_KEY = process.env.PUBLIC_KEY || '';
-
 const APP_ID = process.env.APP_ID || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 
