@@ -5,6 +5,7 @@
 // - admin_open / admin_manage:pickmove 直接回覆 ephemeral（type:4, flags:64）避免重複
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
+// - /cteam defaults 可讀取「預設人員名單」附件（Attachment），若有附件則覆蓋文字值
 
 import {
   InteractionType,
@@ -109,6 +110,50 @@ async function withLock(lockKey, ttlSec, fn) {
     memKV.set(key, { val, exp: Date.now() + ttlSec * 1000 });
     try { return await fn(); }
     finally { memKV.delete(key); }
+  }
+}
+
+/* =========================
+ * /cteam 預設名單附件：讀取工具
+ * ========================= */
+const DEFAULTS_FILE_HINT = '預設人員名單';
+// 讀取 /cteam 的附件（option: defaults 或檔名含「預設人員名單」），回傳文字，失敗回 null
+async function loadDefaultsFromAttachment(interaction, optionName = 'defaults') {
+  try {
+    const opts = interaction.data?.options || [];
+    const resolvedAtt = interaction.data?.resolved?.attachments || {};
+
+    // 若 defaults 是 Attachment 選項（type=11），value 會是附件 id
+    const opt = opts.find(o => o.name === optionName);
+    let att = (opt && resolvedAtt[opt.value]) ? resolvedAtt[opt.value] : null;
+
+    // 若沒有直接指定，從 resolved.attachments 中找檔名包含關鍵字的
+    if (!att) {
+      for (const k in resolvedAtt) {
+        const a = resolvedAtt[k];
+        const fname = String(a?.filename || a?.name || '');
+        if (fname.includes(DEFAULTS_FILE_HINT)) { att = a; break; }
+      }
+    }
+    if (!att) return null;
+
+    if (att.size && att.size > 2 * 1024 * 1024) {
+      console.warn('defaults attachment too large:', att.size);
+      return null;
+    }
+
+    const url = att.url || att.proxy_url;
+    if (!url) return null;
+
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) {
+      console.warn('fetch defaults attachment failed', r.status, await r.text());
+      return null;
+    }
+    return await r.text();
+  } catch (e) {
+    console.error('loadDefaultsFromAttachment error', e);
+    return null;
   }
 }
 
@@ -344,7 +389,12 @@ export default async function handler(req, res) {
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
     const title = getOpt(opts, 'title') || '';
-    const defaults = getOpt(opts, 'defaults') || '';
+
+    // 文字 defaults + 嘗試讀附件，附件成功則覆蓋
+    let defaults = getOpt(opts, 'defaults') || '';
+    const attachTxt = await loadDefaultsFromAttachment(interaction, 'defaults');
+    if (attachTxt) defaults = attachTxt;
+
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
     const initState = buildInitialState({
