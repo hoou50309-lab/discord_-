@@ -15,7 +15,6 @@ import {
 /* =========================
  * 環境與開關
  * ========================= */
-// 自動依環境切換：若未手動設定 VERIFY_SIGNATURE，Production 預設開啟，非 Production 預設關閉
 const _resolvedVerify =
   (process.env.VERIFY_SIGNATURE ??
    ((process.env.VERCEL === '1' ||
@@ -124,7 +123,7 @@ async function withLock(lockKey, ttlSec, fn) {
  *   multi: boolean,
  *   messageId: string|null,
  *   ownerId: string,
- *   token: string|null          // ★ 原始 /cteam 的 webhook token
+ *   token: string|null
  * }
  */
 function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, token }) {
@@ -151,7 +150,7 @@ function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, t
     multi: !!multi,
     messageId: messageId || null,
     ownerId: ownerId || '',
-    token: token || null,       // ★
+    token: token || null,
   };
 }
 async function saveStateById(messageId, state) {
@@ -201,9 +200,9 @@ function buildMainButtons(groupCount) {
   return rows;
 }
 
-/* === 修改：管理面板 custom_id 夾帶原文 messageId === */
+/* === 管理面板 custom_id 夾帶原文 messageId === */
 function buildAdminPanelSelects(state) {
-  const targetMid = state.messageId || ''; // 原文訊息 id
+  const targetMid = state.messageId || '';
   const optionsKick = [];
   const optionsMovePick = [];
   const groups = state.caps.length;
@@ -223,7 +222,7 @@ function buildAdminPanelSelects(state) {
       type: 1,
       components: [{
         type: 3,
-        custom_id: `admin_manage:kick:${targetMid}`, // ★
+        custom_id: `admin_manage:kick:${targetMid}`,
         placeholder: '選擇要踢出的成員',
         min_values: 1, max_values: 1, options: optionsKick,
       }],
@@ -234,7 +233,7 @@ function buildAdminPanelSelects(state) {
       type: 1,
       components: [{
         type: 3,
-        custom_id: `admin_manage:pickmove:${targetMid}`, // ★
+        custom_id: `admin_manage:pickmove:${targetMid}`,
         placeholder: '選擇要移組的成員（下一步選目的團）',
         min_values: 1, max_values: 1, options: optionsMovePick,
       }],
@@ -249,7 +248,7 @@ function buildAdminPanelSelects(state) {
   return components;
 }
 
-/* === 修改：第二步目的團 custom_id 也帶 messageId === */
+/* === 第二步目的團 custom_id 也帶 messageId === */
 function buildMoveToSelect(state, userId, fromIdx) {
   const targetMid = state.messageId || '';
   const options = [];
@@ -265,7 +264,7 @@ function buildMoveToSelect(state, userId, fromIdx) {
     type: 1,
     components: [{
       type: 3,
-      custom_id: `admin_manage:to:${userId}:${fromIdx}:${targetMid}`, // ★
+      custom_id: `admin_manage:to:${userId}:${fromIdx}:${targetMid}`,
       placeholder: '選擇目的團',
       min_values: 1, max_values: 1,
       options: options.length ? options : [{ label: '沒有可移動的團', value: '0', default: true }],
@@ -326,14 +325,14 @@ export default async function handler(req, res) {
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
     const title = getOpt(opts, 'title') || '';
-    the defaults = getOpt(opts, 'defaults') || '';
+    const defaults = getOpt(opts, 'defaults') || ''; // ★ 修正
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
     const initState = buildInitialState({
       title, caps, multi, defaults,
       messageId: null,
       ownerId,
-      token: interaction.token,     // ★ 保存原始 webhook token
+      token: interaction.token,
     });
     await kvSet(`boot:${interaction.token}`, initState, 3600);
 
@@ -354,21 +353,21 @@ export default async function handler(req, res) {
     const message = interaction.message;
     const messageId = message?.id;
 
-    /* === 解析 custom_id 末段的原文 messageId，優先使用它 === */
+    // 解析 custom_id 末段的原文 messageId（避免 .at 相容性問題）
     const msgIdFromCid = customId.startsWith('admin_manage:')
-      ? customId.split(':').at(-1)
+      ? customId.split(':').slice(-1)[0] // ★ 修正
       : null;
     const targetMessageId = msgIdFromCid || messageId;
 
-    // 先準備 state（供「直接回 ephemeral」的分支使用）
+    // 先準備 state
     let baseState =
         await loadStateById(targetMessageId)
      || await kvGet(`boot:${interaction.token}`)
      || fallbackStateFromContent(message?.content || '');
     baseState.messageId = targetMessageId;
-    if (!baseState.token) baseState.token = interaction.token;   // ★ 補 token
+    if (!baseState.token) baseState.token = interaction.token;
 
-    // === 直接回 ephemeral（避免重複）===
+    // 直接回 ephemeral（避免重複）
     if (customId === 'admin_open') {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
@@ -416,7 +415,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // === 快速路徑：join/leave 嘗試在同次請求內完成並 UPDATE_MESSAGE ===
+    // 快速路徑：join/leave
     if (FAST_UPDATE) {
       try {
         const quick = await Promise.race([
@@ -456,7 +455,7 @@ export default async function handler(req, res) {
                 state.caps[idx - 1] += 1;
               }
 
-              await saveStateById(targetMessageId, state); // ★
+              await saveStateById(targetMessageId, state);
               baseState = state;
             });
 
@@ -489,7 +488,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // === 保險路徑：先 defer，再背景處理 + PATCH 或 ephemeral 成功訊息 ===
+    // 保險路徑
     res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
 
     (async () => {
@@ -499,11 +498,10 @@ export default async function handler(req, res) {
          || await kvGet(`boot:${interaction.token}`)
          || fallbackStateFromContent(message?.content || '');
         state.messageId = targetMessageId;
-        if (!state.token) state.token = interaction.token;  // ★ 補 token
+        if (!state.token) state.token = interaction.token;
 
         const cid = customId;
 
-        // admin_manage:kick / admin_manage:to:* 需要修改名單 → defer + PATCH
         if (cid.startsWith('admin_manage:')) {
           if (!hasAdmin(interaction, state)) {
             await followupEphemeral(interaction, '只有開團者或伺服器管理員可以使用管理功能。');
@@ -511,7 +509,7 @@ export default async function handler(req, res) {
           }
 
           await withLock(`msg:${targetMessageId}`, 5, async () => {
-            if (cid.startsWith('admin_manage:kick:')) { // ★
+            if (cid.startsWith('admin_manage:kick:')) {
               const v = interaction.data.values?.[0] || '';
               const m = v.match(/^kick:(\d+):(\d+)$/);
               if (!m) return;
@@ -555,7 +553,6 @@ export default async function handler(req, res) {
           return;
         }
 
-        // 其餘 join/leave 在保險路徑處理
         const m = cid.match(/^(join|leave)_(\d+)$/);
         if (m) {
           const action = m[1];
@@ -624,9 +621,8 @@ async function patchOriginal(interaction, state) {
   const newContent = buildMessageText(state);
   const newComponents = buildMainButtons(state.caps.length);
 
-  // ★ 使用「原始 /cteam 的 webhook token」+ messageId，無論從哪個互動來都能更新原文
   const token = state.token || interaction.token;
-  const msgId = state.messageId; // components 互動一定會有
+  const msgId = state.messageId;
   const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${token}/messages/${msgId}`;
 
   const r = await fetch(url, {
@@ -692,5 +688,5 @@ function fallbackStateFromContent(content) {
     caps.push(12,12,12);
     members["1"] = []; members["2"] = []; members["3"] = [];
   }
-  return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null }; // ★ token:null
+  return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null };
 }
