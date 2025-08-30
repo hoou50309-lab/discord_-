@@ -1,7 +1,8 @@
 // api/discord.js
 // 穩定版 + 管理選單（踢人 / 移組）
 // - /cteam 直接同步回覆（type:4）
-// - 按鈕/選單：defer + PATCH + fallback ephemeral
+// - 快速路徑：join/leave 在 2.2 秒內嘗試直接 UPDATE_MESSAGE（type:7）
+// - 超時/鎖衝突 → 保險路徑：defer + 背景 PATCH
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - 不顯示 STATE/隱藏欄位；mentions 關閉
 // - 簽章驗證可關（預設關閉），要通過 Discord 安檢時設 VERIFY_SIGNATURE=true
@@ -24,6 +25,11 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const RURL = process.env.UPSTASH_REDIS_REST_URL || '';
 const RTOK = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const HAVE_REDIS = !!(RURL && RTOK);
+
+// 快速路徑參數（縮短按鈕等待時間）
+const FAST_UPDATE = true;        // 開啟快速回應
+const LOCK_TTL_SEC = 2;          // 快速路徑鎖 TTL
+const FAST_TIMEOUT_MS = 2200;    // 快速路徑最多花 2.2 秒，超時就走保險路徑
 
 /* =========================
  * 小工具/基礎
@@ -362,7 +368,104 @@ export default async function handler(req, res) {
     const message = interaction.message;
     const messageId = message?.id;
 
-    // 先回 defer（避免 3 秒超時）
+    // ---------- 快速路徑：嘗試在同次請求內拿鎖 + 更新 + 直接 UPDATE_MESSAGE ----------
+    if (FAST_UPDATE) {
+      try {
+        const quick = await Promise.race([
+          (async () => {
+            // 先取 state（Redis > boot:token > 從訊息內容回推）
+            let state = await loadStateById(messageId)
+                    || await kvGet(`boot:${interaction.token}`)
+                    || fallbackStateFromContent(message?.content || '');
+            state.messageId = messageId;
+
+            // 僅 admin_open 不改動訊息：直接送 ephemeral 並回「無需更新」
+            if (customId === 'admin_open') {
+              if (!hasAdmin(interaction, state)) {
+                await followupEphemeral(interaction, '只有開團者或伺服器管理員可以使用管理功能。');
+              } else {
+                const comps = buildAdminPanelSelects(state);
+                await postEphemeral(interaction, { content: '管理名單（踢人 / 移組）', components: comps });
+              }
+              return { kind: 'defer' }; // 不更新訊息本體，後面會回 6
+            }
+
+            // 快速處理 join/leave
+            const jm = customId.match(/^(join|leave)_(\d+)$/);
+            if (jm) {
+              const action = jm[1];
+              const idx = parseInt(jm[2], 10);
+
+              // 在鎖內更新
+              await withLock(`msg:${messageId}`, LOCK_TTL_SEC, async () => {
+                const myGroups = Object.entries(state.members)
+                  .filter(([, arr]) => Array.isArray(arr) && arr.includes(userId))
+                  .map(([k]) => parseInt(k, 10));
+
+                if (action === 'join') {
+                  if (!state.multi && myGroups.length > 0 && !myGroups.includes(idx)) {
+                    await followupEphemeral(interaction, '你已加入其他團，未開啟「允許多團」。');
+                    return;
+                  }
+                  if (state.caps[idx - 1] <= 0) {
+                    await followupEphemeral(interaction, `第${numToHan(idx)}團名額已滿。`);
+                    return;
+                  }
+                  const arr = state.members[String(idx)];
+                  if (!arr.includes(userId)) {
+                    arr.push(userId);
+                    state.caps[idx - 1] -= 1;
+                  } else {
+                    await followupEphemeral(interaction, `你已在第${numToHan(idx)}團。`);
+                    return;
+                  }
+                } else {
+                  const arr = state.members[String(idx)];
+                  const pos = arr.indexOf(userId);
+                  if (pos === -1) {
+                    await followupEphemeral(interaction, `你不在第${numToHan(idx)}團。`);
+                    return;
+                  }
+                  arr.splice(pos, 1);
+                  state.caps[idx - 1] += 1;
+                }
+
+                await saveStateById(messageId, state);
+              });
+
+              // 準備直接 UPDATE_MESSAGE 的資料
+              const data = {
+                content: buildMessageText(state),
+                components: buildMainButtons(state.caps.length),
+                allowed_mentions: { parse: [] },
+              };
+              return { kind: 'update', data };
+            }
+
+            // 其他互動（admin_manage 等）→ 交給保險路徑
+            return null;
+          })(),
+          sleep(FAST_TIMEOUT_MS).then(() => null),
+        ]);
+
+        if (quick?.kind === 'update') {
+          // 直接同步回覆：UPDATE_MESSAGE（type:7）
+          return res.status(200).json({
+            type: InteractionResponseType.UPDATE_MESSAGE,
+            data: quick.data,
+          });
+        }
+        if (quick?.kind === 'defer') {
+          // 僅做了 ephemeral；訊息本體不需更新 → 給一個 defer 即可
+          return res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
+        }
+        // 若 quick === null（超時/未處理），落到保險路徑
+      } catch {
+        // 發生例外則落到保險路徑
+      }
+    }
+
+    // ---------- 保險路徑：先回 defer，再背景處理 + PATCH ----------
     res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE }); // 6
 
     // 背景處理
@@ -373,6 +476,8 @@ export default async function handler(req, res) {
         if (!state) state = await kvGet(`boot:${interaction.token}`);
         if (!state) { state = fallbackStateFromContent(message?.content || ''); state.messageId = messageId; }
         else { state.messageId = messageId; }
+
+        const customId = interaction.data?.custom_id || '';
 
         // 管理面板入口
         if (customId === 'admin_open') {
@@ -470,7 +575,7 @@ export default async function handler(req, res) {
           return;
         }
 
-        // 一般 join/leave
+        // 一般 join/leave（保險路徑）
         const m = customId.match(/^(join|leave)_(\d+)$/);
         if (m) {
           const action = m[1];
