@@ -296,7 +296,24 @@ function hasAdmin(interaction, state) {
  * 互動處理
  * ========================= */
 export default async function handler(req, res) {
-  if (req.method === 'HEAD') return res.status(200).end();
+  if (req.method === 'HEAD') {
+	if (VERIFY_SIGNATURE) {
+		const signature = req.headers['x-signature-ed25519'];
+		const timestamp = req.headers['x-signature-timestamp'];
+		// HEAD 沒有 body，用空字串驗簽；缺簽或驗簽失敗都要回 401
+	  if (!signature || !timestamp) {
+        return res.status(401).send('missing signature');
+      }
+      try {
+         const ok = verifyKey('', signature, timestamp, PUBLIC_KEY);
+         if (!ok) return res.status(401).send('invalid request signature');
+	  } catch {
+		return res.status(401).send('invalid request signature');
+	 }
+	}
+	return res.status(200).end();
+   }
+   
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   const signature = req.headers['x-signature-ed25519'];
@@ -690,3 +707,8 @@ function fallbackStateFromContent(content) {
   }
   return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null };
 }
+
+// 確保能讀到 raw body（Next.js API Route）
+export const config = {
+  api: { bodyParser: false },
+};
