@@ -1,5 +1,5 @@
 // api/discord.js
-// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定 + 方案一（custom_id 編碼 multi）
+// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定（修正從 ephemeral 觸發時無法更新原文）
 // - /cteam 同步回覆（type:4）
 // - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
 // - admin_open / admin_manage:pickmove 直接回覆 ephemeral（type:4, flags:64）避免重複
@@ -15,6 +15,7 @@ import {
 /* =========================
  * 環境與開關
  * ========================= */
+// 自動依環境切換：若未手動設定 VERIFY_SIGNATURE，Production 預設開啟，非 Production 預設關閉
 const _resolvedVerify =
   (process.env.VERIFY_SIGNATURE ??
    ((process.env.VERCEL === '1' ||
@@ -123,7 +124,7 @@ async function withLock(lockKey, ttlSec, fn) {
  *   multi: boolean,
  *   messageId: string|null,
  *   ownerId: string,
- *   token: string|null
+ *   token: string|null          // ★ 原始 /cteam 的 webhook token
  * }
  */
 function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, token }) {
@@ -150,7 +151,7 @@ function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, t
     multi: !!multi,
     messageId: messageId || null,
     ownerId: ownerId || '',
-    token: token || null,
+    token: token || null,       // ★
   };
 }
 async function saveStateById(messageId, state) {
@@ -182,16 +183,14 @@ function buildMessageText(state) {
   return lines.join('\n');
 }
 
-// ★ 方案 1：multi 會被編碼進 custom_id 後綴 :m1
-function buildMainButtons(groupCount, multi = false) {
+function buildMainButtons(groupCount) {
   const rows = [];
-  const mflag = multi ? ':m1' : '';
   for (let i = 1; i <= groupCount; i++) {
     rows.push({
       type: 1,
       components: [
-        { type: 2, style: 3, custom_id: `join_${i}${mflag}`,  label: `加入第${numToHan(i)}團` },
-        { type: 2, style: 2, custom_id: `leave_${i}${mflag}`, label: `離開第${numToHan(i)}團` },
+        { type: 2, style: 3, custom_id: `join_${i}`, label: `加入第${numToHan(i)}團` },
+        { type: 2, style: 2, custom_id: `leave_${i}`, label: `離開第${numToHan(i)}團` },
       ],
     });
   }
@@ -202,7 +201,9 @@ function buildMainButtons(groupCount, multi = false) {
   return rows;
 }
 
+/* === 修改：管理面板 custom_id 夾帶原文 messageId === */
 function buildAdminPanelSelects(state) {
+  const targetMid = state.messageId || ''; // 原文訊息 id
   const optionsKick = [];
   const optionsMovePick = [];
   const groups = state.caps.length;
@@ -222,7 +223,7 @@ function buildAdminPanelSelects(state) {
       type: 1,
       components: [{
         type: 3,
-        custom_id: 'admin_manage:kick',
+        custom_id: `admin_manage:kick:${targetMid}`, // ★
         placeholder: '選擇要踢出的成員',
         min_values: 1, max_values: 1, options: optionsKick,
       }],
@@ -233,7 +234,7 @@ function buildAdminPanelSelects(state) {
       type: 1,
       components: [{
         type: 3,
-        custom_id: 'admin_manage:pickmove',
+        custom_id: `admin_manage:pickmove:${targetMid}`, // ★
         placeholder: '選擇要移組的成員（下一步選目的團）',
         min_values: 1, max_values: 1, options: optionsMovePick,
       }],
@@ -248,7 +249,9 @@ function buildAdminPanelSelects(state) {
   return components;
 }
 
+/* === 修改：第二步目的團 custom_id 也帶 messageId === */
 function buildMoveToSelect(state, userId, fromIdx) {
+  const targetMid = state.messageId || '';
   const options = [];
   const groups = state.caps.length;
   for (let g = 1; g <= groups; g++) {
@@ -262,7 +265,7 @@ function buildMoveToSelect(state, userId, fromIdx) {
     type: 1,
     components: [{
       type: 3,
-      custom_id: `admin_manage:to:${userId}:${fromIdx}`,
+      custom_id: `admin_manage:to:${userId}:${fromIdx}:${targetMid}`, // ★
       placeholder: '選擇目的團',
       min_values: 1, max_values: 1,
       options: options.length ? options : [{ label: '沒有可移動的團', value: '0', default: true }],
@@ -323,14 +326,14 @@ export default async function handler(req, res) {
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
     const title = getOpt(opts, 'title') || '';
-    const defaults = getOpt(opts, 'defaults') || '';
+    the defaults = getOpt(opts, 'defaults') || '';
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
     const initState = buildInitialState({
       title, caps, multi, defaults,
       messageId: null,
       ownerId,
-      token: interaction.token, // 保存原始 webhook token
+      token: interaction.token,     // ★ 保存原始 webhook token
     });
     await kvSet(`boot:${interaction.token}`, initState, 3600);
 
@@ -338,7 +341,7 @@ export default async function handler(req, res) {
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
       data: {
         content: buildMessageText(initState),
-        components: buildMainButtons(caps.length, multi), // ★ 帶 multi
+        components: buildMainButtons(caps.length),
         allowed_mentions: { parse: [] },
       },
     });
@@ -351,13 +354,19 @@ export default async function handler(req, res) {
     const message = interaction.message;
     const messageId = message?.id;
 
+    /* === 解析 custom_id 末段的原文 messageId，優先使用它 === */
+    const msgIdFromCid = customId.startsWith('admin_manage:')
+      ? customId.split(':').at(-1)
+      : null;
+    const targetMessageId = msgIdFromCid || messageId;
+
     // 先準備 state（供「直接回 ephemeral」的分支使用）
     let baseState =
-        await loadStateById(messageId)
+        await loadStateById(targetMessageId)
      || await kvGet(`boot:${interaction.token}`)
      || fallbackStateFromContent(message?.content || '');
-    baseState.messageId = messageId;
-    if (!baseState.token) baseState.token = interaction.token;
+    baseState.messageId = targetMessageId;
+    if (!baseState.token) baseState.token = interaction.token;   // ★ 補 token
 
     // === 直接回 ephemeral（避免重複）===
     if (customId === 'admin_open') {
@@ -414,22 +423,19 @@ export default async function handler(req, res) {
           (async () => {
             let state = { ...baseState };
 
-            const jm = customId.match(/^(join|leave)_(\d+)(?::m1)?$/); // ★ 接受 :m1
+            const jm = customId.match(/^(join|leave)_(\d+)$/);
             if (!jm) return null;
 
             const action = jm[1];
             const idx = parseInt(jm[2], 10);
-            const allowMultiFromId = /:m1$/.test(customId);
-            const canMulti = state.multi || allowMultiFromId;
-            if (allowMultiFromId && !state.multi) state.multi = true; // ★ 永續化
 
-            await withLock(`msg:${messageId}`, LOCK_TTL_SEC, async () => {
+            await withLock(`msg:${targetMessageId}`, LOCK_TTL_SEC, async () => {
               const myGroups = Object.entries(state.members)
                 .filter(([, arr]) => Array.isArray(arr) && arr.includes(userId))
                 .map(([k]) => parseInt(k, 10));
 
               if (action === 'join') {
-                if (!canMulti && myGroups.length > 0 && !myGroups.includes(idx)) {
+                if (!state.multi && myGroups.length > 0 && !myGroups.includes(idx)) {
                   throw new Error('EPH:你已加入其他團，未開啟「允許多團」。');
                 }
                 if (state.caps[idx - 1] <= 0) {
@@ -450,7 +456,7 @@ export default async function handler(req, res) {
                 state.caps[idx - 1] += 1;
               }
 
-              await saveStateById(messageId, state);
+              await saveStateById(targetMessageId, state); // ★
               baseState = state;
             });
 
@@ -458,7 +464,7 @@ export default async function handler(req, res) {
               kind: 'update',
               data: {
                 content: buildMessageText(baseState),
-                components: buildMainButtons(baseState.caps.length, baseState.multi), // ★
+                components: buildMainButtons(baseState.caps.length),
                 allowed_mentions: { parse: [] },
               }
             };
@@ -489,11 +495,11 @@ export default async function handler(req, res) {
     (async () => {
       try {
         let state =
-            await loadStateById(messageId)
+            await loadStateById(targetMessageId)
          || await kvGet(`boot:${interaction.token}`)
          || fallbackStateFromContent(message?.content || '');
-        state.messageId = messageId;
-        if (!state.token) state.token = interaction.token;
+        state.messageId = targetMessageId;
+        if (!state.token) state.token = interaction.token;  // ★ 補 token
 
         const cid = customId;
 
@@ -504,8 +510,8 @@ export default async function handler(req, res) {
             return;
           }
 
-          await withLock(`msg:${messageId}`, 5, async () => {
-            if (cid === 'admin_manage:kick') {
+          await withLock(`msg:${targetMessageId}`, 5, async () => {
+            if (cid.startsWith('admin_manage:kick:')) { // ★
               const v = interaction.data.values?.[0] || '';
               const m = v.match(/^kick:(\d+):(\d+)$/);
               if (!m) return;
@@ -517,14 +523,14 @@ export default async function handler(req, res) {
               arr.splice(pos, 1);
               state.caps[g - 1] += 1;
 
-              await saveStateById(messageId, state);
+              await saveStateById(targetMessageId, state);
               await patchOriginal(interaction, state);
               await followupEphemeral(interaction, `已將 <@${kickId}> 踢出第${numToHan(g)}團。`);
               return;
             }
 
             if (cid.startsWith('admin_manage:to:')) {
-              const seg = cid.split(':'); // admin_manage:to:{uid}:{from}
+              const seg = cid.split(':'); // admin_manage:to:{uid}:{from}:{msgId}
               const moveId = seg[2];
               const fromIdx = parseInt(seg[3], 10);
               const toIdx = parseInt(interaction.data.values?.[0] || '0', 10);
@@ -540,7 +546,7 @@ export default async function handler(req, res) {
               const toArr = state.members[String(toIdx)] || [];
               if (!toArr.includes(moveId)) { toArr.push(moveId); state.caps[toIdx - 1] -= 1; }
 
-              await saveStateById(messageId, state);
+              await saveStateById(targetMessageId, state);
               await patchOriginal(interaction, state);
               await followupEphemeral(interaction, `已將 <@${moveId}> 從第${numToHan(fromIdx)}團移至第${numToHan(toIdx)}團。`);
               return;
@@ -550,21 +556,18 @@ export default async function handler(req, res) {
         }
 
         // 其餘 join/leave 在保險路徑處理
-        const m = cid.match(/^(join|leave)_(\d+)(?::m1)?$/); // ★ 接受 :m1
+        const m = cid.match(/^(join|leave)_(\d+)$/);
         if (m) {
           const action = m[1];
           const idx = parseInt(m[2], 10);
-          const allowMultiFromId = /:m1$/.test(cid);
-          const canMulti = state.multi || allowMultiFromId;
-          if (allowMultiFromId && !state.multi) state.multi = true; // ★ 永續化
 
-          await withLock(`msg:${messageId}`, 4, async () => {
+          await withLock(`msg:${targetMessageId}`, 4, async () => {
             const myGroups = Object.entries(state.members)
               .filter(([, arr]) => Array.isArray(arr) && arr.includes(userId))
               .map(([k]) => parseInt(k, 10));
 
             if (action === 'join') {
-              if (!canMulti && myGroups.length > 0 && !myGroups.includes(idx)) {
+              if (!state.multi && myGroups.length > 0 && !myGroups.includes(idx)) {
                 await followupEphemeral(interaction, '你已加入其他團，未開啟「允許多團」。');
                 return;
               }
@@ -591,7 +594,7 @@ export default async function handler(req, res) {
               state.caps[idx - 1] += 1;
             }
 
-            await saveStateById(messageId, state);
+            await saveStateById(targetMessageId, state);
             await patchOriginal(interaction, state);
           });
 
@@ -619,11 +622,11 @@ export default async function handler(req, res) {
  * ========================= */
 async function patchOriginal(interaction, state) {
   const newContent = buildMessageText(state);
-  const newComponents = buildMainButtons(state.caps.length, state.multi); // ★
+  const newComponents = buildMainButtons(state.caps.length);
 
-  // 使用「原始 /cteam 的 webhook token」+ messageId，無論從哪個互動來都能更新原文
+  // ★ 使用「原始 /cteam 的 webhook token」+ messageId，無論從哪個互動來都能更新原文
   const token = state.token || interaction.token;
-  const msgId = state.messageId;
+  const msgId = state.messageId; // components 互動一定會有
   const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${token}/messages/${msgId}`;
 
   const r = await fetch(url, {
@@ -643,7 +646,7 @@ async function patchOriginal(interaction, state) {
 }
 
 /* =========================
- * 輔助：ephemeral follow-up
+ * 輔助：ephemeral follow-up / post
  * ========================= */
 async function followupEphemeral(interaction, text) {
   try {
@@ -689,5 +692,5 @@ function fallbackStateFromContent(content) {
     caps.push(12,12,12);
     members["1"] = []; members["2"] = []; members["3"] = [];
   }
-  return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null };
+  return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null }; // ★ token:null
 }
