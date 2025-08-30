@@ -1,513 +1,563 @@
-// api/discord.js — Verify-Only + Stable Full Function (default verify-only ON)
+// api/discord.js
+export const config = { runtime: 'nodejs' };
+
 import {
   InteractionType,
   InteractionResponseType,
   verifyKey,
 } from 'discord-interactions';
 
-export const config = { runtime: 'nodejs' };
+// ============ Env & switches ============
+const PUBLIC_KEY  = process.env.PUBLIC_KEY;
+const VERIFY_ONLY = String(process.env.VERIFY_ONLY ?? 'false').toLowerCase() === 'true'; // 預設關閉
+const RURL        = process.env.UPSTASH_REDIS_REST_URL || '';
+const RTOK        = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const HAVE_REDIS  = !!(RURL && RTOK);
 
-// ===== utils =====
+// ============ Utils ============
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 async function readRawBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   return Buffer.concat(chunks).toString('utf8');
 }
-const j = (res, code, obj) => res.status(code).json(obj);
-const now = () => new Date().toISOString().slice(11, 19);
 
-// env 開關：預設啟用 verify-only
-const VERIFY_ONLY_DEFAULT = false
-  (process.env.VERIFY_ONLY ?? 'true').toString().toLowerCase() !== 'false';
-function isVerifyOnly(req) {
-  const q = (req.query?.verify ?? req.query?.mode)?.toString().toLowerCase();
-  if (q === '1' || q === 'true' || q === 'verify') return true;
-  if (q === '0' || q === 'false' || q === 'full') return false;
-  const h = req.headers['x-verify-only']?.toString().toLowerCase();
-  if (h === '1' || h === 'true') return true;
-  if (h === '0' || h === 'false') return false;
-  return VERIFY_ONLY_DEFAULT;
+// Discord API with retry/backoff
+async function discordFetch(url, init, maxRetry = 5) {
+  for (let i = 0; i < maxRetry; i++) {
+    const r = await fetch(url, init);
+    if (r.status === 429) {
+      const wait = Number(r.headers.get('x-ratelimit-reset-after')) || 0.7;
+      await sleep(wait * 1000 + Math.random() * 200);
+      continue;
+    }
+    if (r.status >= 500) {
+      await sleep(250 + i * 150);
+      continue;
+    }
+    return r;
+  }
+  throw new Error('discordFetch-retry-exhausted');
 }
 
-// ===== state helpers (hidden comment) =====
-const STATE_RE = /<!--\s*state:\s*({[\s\S]*?})\s*-->/i;
+// Upstash Redis
+async function redis(cmd, ...args) {
+  if (!HAVE_REDIS) return null;
+  const url = `${RURL}/${cmd}/${args.map(encodeURIComponent).join('/')}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${RTOK}` } });
+  const j = await r.json().catch(() => ({}));
+  return j;
+}
 
-function parseStateFrom(content) {
-  const m = content.match(STATE_RE);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[1]);
-  } catch {
-    return null;
+// 分散式鎖（Upstash）/ 本地退化
+const localLocks = new Map();
+async function withLock(key, ttlMs, fn) {
+  if (HAVE_REDIS) {
+    const token = crypto.randomUUID();
+    for (let i = 0; i < 6; i++) {
+      const set = await redis('SET', key, token, 'NX', 'PX', ttlMs);
+      if (set?.result === 'OK') {
+        try {
+          return await fn();
+        } finally {
+          const cur = await redis('GET', key);
+          if (cur?.result === token) await redis('DEL', key);
+        }
+      }
+      await sleep(50 + Math.random() * 150);
+    }
+    throw new Error('lock-timeout');
+  } else {
+    if (localLocks.has(key)) {
+      for (let i = 0; i < 8 && localLocks.has(key); i++) {
+        await sleep(60 + Math.random() * 120);
+      }
+      if (localLocks.has(key)) throw new Error('lock-timeout');
+    }
+    localLocks.set(key, 1);
+    try {
+      return await fn();
+    } finally {
+      localLocks.delete(key);
+    }
   }
 }
 
-function setStateInContent(base, stateObj) {
-  const cleaned = base.replace(STATE_RE, '').trim();
-  return `${cleaned}\n\n<!-- state: ${JSON.stringify(stateObj)} -->`;
+// Ephemeral admin context（存「目前選取的成員」）
+const localEphemeral = new Map();
+function gcLocalEphemeral() {
+  const now = Date.now();
+  for (const [k, v] of localEphemeral) if (v.exp < now) localEphemeral.delete(k);
+}
+async function setEphemeral(key, val, ttlMs = 120000) {
+  if (HAVE_REDIS) {
+    await redis('SET', `admctx:${key}`, JSON.stringify(val), 'PX', ttlMs);
+  } else {
+    gcLocalEphemeral();
+    localEphemeral.set(key, { exp: Date.now() + ttlMs, val });
+  }
+}
+async function getEphemeral(key) {
+  if (HAVE_REDIS) {
+    const j = await redis('GET', `admctx:${key}`);
+    if (j?.result) try { return JSON.parse(j.result); } catch {}
+    return null;
+  } else {
+    gcLocalEphemeral();
+    const hit = localEphemeral.get(key);
+    if (!hit) return null;
+    if (hit.exp < Date.now()) { localEphemeral.delete(key); return null; }
+    return hit.val;
+  }
 }
 
-// ===== rendering =====
-function mention(uid) {
-  return `<@${uid}>`;
+// ============ State helpers ============
+function emptyState(maxCaps = [5, 5, 5], title = '', multi = false, ownerId = '') {
+  const members = {};
+  for (let i = 1; i <= maxCaps.length; i++) members[String(i)] = [];
+  return { version: 1, title, max: maxCaps, members, multi, ownerId };
 }
-function renderMemberLine(ids) {
-  if (!ids || ids.length === 0) return '（無）';
-  return ids.map(mention).join(' ');
+
+function parseDefaults(defaultsStr = '') {
+  const obj = {};
+  const lines = String(defaultsStr || '')
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const m = line.match(/^(\d+)\s*:\s*(.+)$/);
+    if (!m) continue;
+    const idx = String(parseInt(m[1], 10));
+    const ids = Array.from(m[2].matchAll(/<@!?(\d+)>/g)).map(x => x[1]);
+    obj[idx] = ids;
+  }
+  return obj;
 }
-function renderContent(state) {
-  const capLeft = state.caps; // 剩餘名額陣列
+
+function buildContentFromState(state) {
+  const han = ['零','一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六','十七','十八','十九','二十'];
+  const numToHan = (n) => han[n] ?? String(n);
+
   const lines = [];
-  if (state.title) lines.push(`${state.title}`);
-  lines.push(
-    `第一團（-${capLeft[0]}）`,
-    ``,
-    `第二團（-${capLeft[1]}）`,
-    ``,
-    `第三團（-${capLeft[2]}）`,
-    ``,
-    `目前名單：`,
-    `第一團： ${renderMemberLine(state.members['1'])}`,
-    `第二團： ${renderMemberLine(state.members['2'])}`,
-    `第三團： ${renderMemberLine(state.members['3'])}`,
-  );
-  return lines.join('\n');
+  if (state.title) {
+    lines.push(state.title);
+    lines.push('');
+  }
+  for (let i = 0; i < state.max.length; i++) {
+    const groupNo = i + 1;
+    const remain = Math.max(0, state.max[i] - (state.members[String(groupNo)]?.length || 0));
+    lines.push(`第${numToHan(groupNo)}團（-${remain}）`);
+    lines.push('');
+  }
+  const hidden = `<!-- state: ${JSON.stringify(state)} -->`;
+  return lines.join('\n') + '\n' + hidden;
 }
 
 function buildComponents(state) {
-  // Row1: Join buttons
-  const row1 = {
-    type: 1,
-    components: [
-      { type: 2, style: 3, custom_id: 'join_1', label: '加入第一團' },
-      { type: 2, style: 3, custom_id: 'join_2', label: '加入第二團' },
-      { type: 2, style: 3, custom_id: 'join_3', label: '加入第三團' },
-    ],
-  };
-  // Row2: Leave buttons
-  const row2 = {
-    type: 1,
-    components: [
-      { type: 2, style: 2, custom_id: 'leave_1', label: '離開第一團' },
-      { type: 2, style: 2, custom_id: 'leave_2', label: '離開第二團' },
-      { type: 2, style: 2, custom_id: 'leave_3', label: '離開第三團' },
-    ],
-  };
-  // Row3: View list
-  const row3 = {
-    type: 1,
-    components: [
-      { type: 2, style: 1, custom_id: 'view_all', label: '查看所有名單' },
-    ],
-  };
-
-  // 管理用選單（所有人可見；只有 owner 可操作）
-  // Select A: 踢人（列出所有成員）
-  const kickOptions = [];
-  for (const g of [1, 2, 3]) {
-    for (const uid of state.members[String(g)]) {
-      kickOptions.push({
-        label: `第${g}團：${uid}`,
-        value: `kick:${uid}:${g}`,
-      });
-    }
-  }
-  const row4 = {
-    type: 1,
-    components: [
-      {
-        type: 3, // string select
-        custom_id: 'admin_kick',
-        placeholder: '管理名單：踢人（開團者限定）',
-        min_values: 1,
-        max_values: 1,
-        options: kickOptions.slice(0, 25), // 安全：最多 25
-      },
-    ],
-  };
-
-  // Select B: 移組（對每位成員產生目標組）
-  const moveOptions = [];
-  for (const from of [1, 2, 3]) {
-    for (const uid of state.members[String(from)]) {
-      for (const to of [1, 2, 3]) {
-        if (to === from) continue;
-        moveOptions.push({
-          label: `將 ${uid}：第${from}→第${to}`,
-          value: `move:${uid}:${from}:${to}`,
-        });
-      }
-    }
-  }
-  const row5 = {
-    type: 1,
-    components: [
-      {
-        type: 3,
-        custom_id: 'admin_move',
-        placeholder: '管理名單：移組（開團者限定）',
-        min_values: 1,
-        max_values: 1,
-        options: moveOptions.slice(0, 25),
-      },
-    ],
-  };
-
-  return [row1, row2, row3, row4, row5];
-}
-
-// ===== business logic =====
-
-function ensureState(state) {
-  // state: { title, caps:[n,n,n], members:{1:[],2:[],3:[]}, multi:false, owner:"id" }
-  if (!state.members) {
-    state.members = { '1': [], '2': [], '3': [] };
-  } else {
-    // 保證 key
-    for (const k of ['1', '2', '3']) if (!state.members[k]) state.members[k] = [];
-  }
-  if (!state.caps) state.caps = [0, 0, 0];
-  if (typeof state.multi !== 'boolean') state.multi = false;
-  return state;
-}
-
-function inWhichGroup(state, uid) {
-  const res = [];
-  for (const g of [1, 2, 3]) {
-    if (state.members[String(g)].includes(uid)) res.push(g);
-  }
-  return res;
-}
-
-function tryJoin(state, uid, g) {
-  g = Number(g);
-  // 不允許重複入多團
-  const my = inWhichGroup(state, uid);
-  if (!state.multi && my.length > 0) {
-    return { ok: false, msg: `你已在第 ${my.join(',')} 團` };
-  }
-  if (state.members[String(g)].includes(uid)) {
-    return { ok: false, msg: `你已在第${g}團` };
-  }
-  if (state.caps[g - 1] <= 0) {
-    return { ok: false, msg: `第${g}團已滿` };
-  }
-  state.members[String(g)].push(uid);
-  state.caps[g - 1] -= 1;
-  return { ok: true };
-}
-
-function tryLeave(state, uid, g) {
-  g = Number(g);
-  const arr = state.members[String(g)];
-  const idx = arr.indexOf(uid);
-  if (idx === -1) return { ok: false, msg: `你不在第${g}團` };
-  arr.splice(idx, 1);
-  state.caps[g - 1] += 1;
-  return { ok: true };
-}
-
-function tryKick(state, uid, g) {
-  g = Number(g);
-  const arr = state.members[String(g)];
-  const idx = arr.indexOf(uid);
-  if (idx === -1) return { ok: false, msg: `該成員不在第${g}團` };
-  arr.splice(idx, 1);
-  state.caps[g - 1] += 1;
-  return { ok: true };
-}
-
-function tryMove(state, uid, from, to) {
-  from = Number(from);
-  to = Number(to);
-  if (from === to) return { ok: false, msg: '來源與目標相同' };
-  const arr = state.members[String(from)];
-  const idx = arr.indexOf(uid);
-  if (idx === -1) return { ok: false, msg: `該成員不在第${from}團` };
-  if (state.caps[to - 1] <= 0) return { ok: false, msg: `第${to}團已滿` };
-  arr.splice(idx, 1);
-  state.caps[from - 1] += 1;
-  state.members[String(to)].push(uid);
-  state.caps[to - 1] -= 1;
-  return { ok: true };
-}
-
-function rebuildMessage(state) {
-  const content = setStateInContent(renderContent(state), state);
-  const components = buildComponents(state);
-  return { content, components };
-}
-
-// 解析 /cteam 參數
-function parseCaps(str) {
-  return String(str || '12,12,12')
-    .split(',')
-    .map((s) => parseInt(s.trim(), 10))
-    .filter((n) => Number.isFinite(n) && n >= 0)
-    .slice(0, 3)
-    .concat([0, 0, 0])
-    .slice(0, 3);
-}
-
-function parseDefaults(str) {
-  // 例：
-  // 1: <@111> <@222>
-  // 2: <@333>
-  // 3:
-  const out = { '1': [], '2': [], '3': [] };
-  if (!str) return out;
-  const lines = String(str).split(/\r?\n/);
-  for (const ln of lines) {
-    const m = ln.match(/^\s*([123])\s*:\s*(.*)$/);
-    if (!m) continue;
-    const g = m[1];
-    const rest = m[2];
-    const ids = Array.from(rest.matchAll(/<@!?(\d+)>/g)).map((x) => x[1]);
-    out[g].push(...ids);
-  }
-  return out;
-}
-
-// ===== FULL APP HANDLER =====
-async function fullAppHandler(interaction, req, res) {
-  // PING
-  if (interaction.type === InteractionType.PING) {
-    return j(res, 200, { type: InteractionResponseType.PONG });
-  }
-
-  // Slash: /cteam
-  if (
-    interaction.type === InteractionType.APPLICATION_COMMAND &&
-    interaction.data?.name === 'cteam'
-  ) {
-    const opts = interaction.data.options || [];
-    const getOpt = (name) => opts.find((o) => o.name === name)?.value;
-
-    const caps = parseCaps(getOpt('caps'));
-    const multi = !!getOpt('multi'); // 預設 false
-    const title = getOpt('title') ? String(getOpt('title')) : '';
-    const defaults = parseDefaults(getOpt('defaults'));
-
-    // 初始 state
-    const owner = interaction.member?.user?.id || interaction.user?.id;
-    const state = ensureState({
-      title,
-      caps: [...caps],
-      members: { '1': [], '2': [], '3': [] },
-      multi,
-      owner,
-    });
-
-    // 套預設名單
-    for (const g of [1, 2, 3]) {
-      for (const uid of defaults[String(g)]) {
-        if (!state.members[String(g)].includes(uid) && state.caps[g - 1] > 0) {
-          state.members[String(g)].push(uid);
-          state.caps[g - 1] -= 1;
-        }
-      }
-    }
-
-    const { content, components } = rebuildMessage(state);
-
-    return j(res, 200, {
-      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: {
-        content,
-        components,
-        allowed_mentions: { parse: [] }, // 不 ping
-      },
+  const rows = [];
+  for (let i = 0; i < state.max.length; i++) {
+    const groupNo = i + 1;
+    rows.push({
+      type: 1,
+      components: [
+        { type: 2, style: 3, custom_id: `join_${groupNo}`,  label: `加入第${groupNo}團` },
+        { type: 2, style: 2, custom_id: `leave_${groupNo}`, label: `離開第${groupNo}團` },
+      ],
     });
   }
-
-  // Components
-  if (interaction.type === InteractionType.MESSAGE_COMPONENT) {
-    const cid = interaction.data?.custom_id || '';
-    const message = interaction.message;
-    const content = message?.content || '';
-    const state = ensureState(parseStateFrom(content) || {});
-
-    // 查看名單（ephemeral）
-    if (cid === 'view_all') {
-      const text =
-        [
-          `目前名單（${now()}）：`,
-          `第一團： ${renderMemberLine(state.members['1'])}`,
-          `第二團： ${renderMemberLine(state.members['2'])}`,
-          `第三團： ${renderMemberLine(state.members['3'])}`,
-        ].join('\n') || '無';
-      return j(res, 200, {
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: text, flags: 64, allowed_mentions: { parse: [] } },
-      });
-    }
-
-    // join / leave
-    const m1 = cid.match(/^(join|leave)_(\d)$/);
-    if (m1) {
-      const act = m1[1];
-      const g = Number(m1[2]);
-      const uid = interaction.member?.user?.id || interaction.user?.id;
-
-      let r;
-      if (act === 'join') r = tryJoin(state, uid, g);
-      else r = tryLeave(state, uid, g);
-
-      if (!r.ok) {
-        return j(res, 200, {
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: r.msg, flags: 64 },
-        });
-      }
-      const { content: newContent, components: newComps } = rebuildMessage(
-        state,
-      );
-      return j(res, 200, {
-        type: InteractionResponseType.UPDATE_MESSAGE,
-        data: {
-          content: newContent,
-          components: newComps,
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
-
-    // 管理：踢人（string select）
-    if (cid === 'admin_kick') {
-      const owner = state.owner;
-      const actor = interaction.member?.user?.id || interaction.user?.id;
-      if (actor !== owner) {
-        return j(res, 200, {
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者可操作。', flags: 64 },
-        });
-      }
-      const v = interaction.data?.values?.[0] || '';
-      const mm = v.match(/^kick:(\d+):([123])$/);
-      if (!mm) {
-        return j(res, 200, {
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '格式錯誤。', flags: 64 },
-        });
-      }
-      const uid = mm[1];
-      const g = Number(mm[2]);
-      const r = tryKick(state, uid, g);
-      if (!r.ok) {
-        return j(res, 200, {
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: r.msg, flags: 64 },
-        });
-      }
-      const { content: newContent, components: newComps } = rebuildMessage(
-        state,
-      );
-      return j(res, 200, {
-        type: InteractionResponseType.UPDATE_MESSAGE,
-        data: {
-          content: newContent,
-          components: newComps,
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
-
-    // 管理：移組（string select）
-    if (cid === 'admin_move') {
-      const owner = state.owner;
-      const actor = interaction.member?.user?.id || interaction.user?.id;
-      if (actor !== owner) {
-        return j(res, 200, {
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者可操作。', flags: 64 },
-        });
-      }
-      const v = interaction.data?.values?.[0] || '';
-      const mm = v.match(/^move:(\d+):([123]):([123])$/);
-      if (!mm) {
-        return j(res, 200, {
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '格式錯誤。', flags: 64 },
-        });
-      }
-      const uid = mm[1];
-      const from = Number(mm[2]);
-      const to = Number(mm[3]);
-      const r = tryMove(state, uid, from, to);
-      if (!r.ok) {
-        return j(res, 200, {
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: r.msg, flags: 64 },
-        });
-      }
-      const { content: newContent, components: newComps } = rebuildMessage(
-        state,
-      );
-      return j(res, 200, {
-        type: InteractionResponseType.UPDATE_MESSAGE,
-        data: {
-          content: newContent,
-          components: newComps,
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
-
-    // 其它元件
-    return j(res, 200, {
-      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: { content: '未支援的操作。', flags: 64 },
-    });
-  }
-
-  // 其它互動
-  return j(res, 200, {
-    type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-    data: { content: '未支援的互動。', flags: 64 },
+  // 工具列：查看所有名單 + 管理名單
+  rows.push({
+    type: 1,
+    components: [
+      { type: 2, style: 1, custom_id: 'view_all',   label: '查看所有名單' },
+      { type: 2, style: 1, custom_id: 'admin_manage', label: '管理名單' },
+    ],
   });
+  return rows;
 }
 
-// ===== Handler (with verify-only gate) =====
+function extractStateFromContent(content) {
+  const m = String(content).match(/<!--\s*state:\s*({[\s\S]*?})\s*-->/i);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
+}
+
+async function loadState(messageId, messageContent) {
+  if (HAVE_REDIS) {
+    const j = await redis('GET', `state:${messageId}`);
+    if (j?.result) { try { return JSON.parse(j.result); } catch {} }
+  }
+  return extractStateFromContent(messageContent) || null;
+}
+
+async function saveState(messageId, state) {
+  if (HAVE_REDIS) {
+    await redis('SET', `state:${messageId}`, JSON.stringify(state));
+  }
+}
+
+// ============ business ops ============
+function removeFromAll(state, userId) {
+  for (const k of Object.keys(state.members)) {
+    state.members[k] = state.members[k].filter(id => id !== userId);
+  }
+}
+function applyJoin(state, groupNo, userId) {
+  const key = String(groupNo);
+  if (state.members[key]?.includes(userId)) return { ok: false, msg: '你已在此團' };
+  if (!state.multi) removeFromAll(state, userId);
+  const remain = state.max[groupNo - 1] - (state.members[key]?.length || 0);
+  if (remain <= 0) return { ok: false, msg: '此團已滿' };
+  state.members[key] ??= [];
+  state.members[key].push(userId);
+  return { ok: true };
+}
+function applyLeave(state, groupNo, userId) {
+  const key = String(groupNo);
+  const pos = state.members[key]?.indexOf(userId) ?? -1;
+  if (pos === -1) return { ok: false, msg: '你不在此團' };
+  state.members[key].splice(pos, 1);
+  return { ok: true };
+}
+function renderViewAll(state) {
+  const lines = [];
+  lines.push('**目前名單：**');
+  for (let i = 0; i < state.max.length; i++) {
+    const k = String(i + 1);
+    const arr = state.members[k] || [];
+    const list = arr.length ? arr.map(id => `<@${id}>`).join('、') : '（無）';
+    lines.push(`第${i + 1}團： ${list}`);
+  }
+  return lines.join('\n');
+}
+
+// ============ permission helper ============
+function hasAdminPerm(member) {
+  try {
+    if (!member?.permissions) return false;
+    const bits = BigInt(member.permissions);
+    const ADMIN = 1n << 3n; // Administrator
+    return (bits & ADMIN) !== 0n;
+  } catch { return false; }
+}
+function isManager(itx, state) {
+  const uid = itx.member?.user?.id || itx.user?.id || '';
+  if (!uid) return false;
+  return uid === state.ownerId || hasAdminPerm(itx.member);
+}
+
+// ============ admin panel builders ============
+function buildAdminPanel(state) {
+  // 1) 成員選單（最多 25）
+  const options = [];
+  for (let i = 0; i < state.max.length; i++) {
+    const n = i + 1;
+    for (const uid of state.members[String(n)] || []) {
+      const label = `第${n}團 - ${uid}`;
+      options.push({ label, value: `${uid}:${n}`, description: `user:${uid}` });
+      if (options.length >= 25) break;
+    }
+    if (options.length >= 25) break;
+  }
+  const rows = [];
+  rows.push({
+    type: 1,
+    components: [{
+      type: 3, // String select
+      custom_id: 'admin_user',
+      placeholder: options.length ? '選擇成員' : '目前沒有成員',
+      min_values: 1,
+      max_values: 1,
+      options: options.length ? options : [{ label: '（無成員）', value: 'none:none', description: '—' }],
+    }],
+  });
+  // 2) 動作列：踢出 / 移組
+  rows.push({
+    type: 1,
+    components: [
+      { type: 2, style: 4, custom_id: 'adm_kick', label: '踢出' },
+    ],
+  });
+  // 3) 目標群列（五顆一排）
+  const perRow = 5;
+  let row = { type: 1, components: [] };
+  for (let i = 1; i <= state.max.length; i++) {
+    row.components.push({ type: 2, style: 1, custom_id: `adm_move_${i}`, label: `移到第${i}團` });
+    if (row.components.length === perRow) {
+      rows.push(row);
+      row = { type: 1, components: [] };
+    }
+  }
+  if (row.components.length) rows.push(row);
+  return rows;
+}
+
+// ============ HTTP handler ============
 export default async function handler(req, res) {
-  // HEAD：必回 200
   if (req.method === 'HEAD') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // 簽章驗證
   const sig = req.headers['x-signature-ed25519'];
-  const ts = req.headers['x-signature-timestamp'];
-  if (!sig || !ts) return res.status(401).send('missing signature headers');
-
+  const ts  = req.headers['x-signature-timestamp'];
   const raw = await readRawBody(req);
-  let ok = false;
+
   try {
-    ok = verifyKey(raw, sig, ts, process.env.PUBLIC_KEY);
+    const ok = await verifyKey(raw, sig, ts, PUBLIC_KEY);
+    if (!ok) return res.status(401).send('invalid request signature');
   } catch {
-    ok = false;
+    return res.status(401).send('invalid request signature');
   }
-  if (!ok) return res.status(401).send('invalid request signature');
 
-  const interaction = JSON.parse(raw);
+  const itx = JSON.parse(raw);
 
-  // 驗證模式（預設開啟）
-  if (isVerifyOnly(req)) {
-    if (interaction.type === InteractionType.PING) {
-      return j(res, 200, { type: InteractionResponseType.PONG });
-    }
-    return j(res, 200, {
+  if (itx.type === InteractionType.PING) {
+    return res.status(200).json({ type: InteractionResponseType.PONG });
+  }
+
+  if (VERIFY_ONLY) {
+    return res.status(200).json({
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: { content: 'OK（verify-only 模式）', flags: 64 },
+      data: { content: 'OK（verify-only）', flags: 64 },
     });
   }
 
-  // 完整功能
-  try {
-    return await fullAppHandler(interaction, req, res);
-  } catch (e) {
-    console.error('full handler error', e);
-    return j(res, 200, {
-      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: { content: 'Internal error', flags: 64 },
-    });
+  // ---- Slash: /cteam ----
+  if (itx.type === InteractionType.APPLICATION_COMMAND && itx.data?.name === 'cteam') {
+    res.status(200).json({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+
+    (async () => {
+      try {
+        const opts = Object.fromEntries((itx.data.options || []).map(o => [o.name, o.value]));
+        const caps  = String(opts.caps ?? '5,5,5').split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n >= 0);
+        if (!caps.length) throw new Error('caps 格式錯誤');
+        const multi = Boolean(opts.multi ?? false);
+        const title = String(opts.title ?? '').slice(0, 200);
+        const defs  = parseDefaults(opts.defaults);
+        const ownerId = itx.member?.user?.id || itx.user?.id || '';
+
+        const state = emptyState(caps, title, multi, ownerId);
+        for (const [k, ids] of Object.entries(defs)) {
+          const idx = parseInt(k, 10);
+          if (!Number.isInteger(idx) || idx < 1 || idx > caps.length) continue;
+          state.members[String(idx)] = Array.from(new Set(ids)).slice(0, caps[idx - 1]);
+        }
+
+        const content    = buildContentFromState(state);
+        const components = buildComponents(state);
+
+        await discordFetch(
+          `https://discord.com/api/v10/webhooks/${itx.application_id}/${itx.token}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              content,
+              components,
+              allowed_mentions: { parse: [] },
+            }),
+          }
+        );
+      } catch (e) {
+        await discordFetch(
+          `https://discord.com/api/v10/webhooks/${itx.application_id}/${itx.token}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: `建立失敗：${e.message || e}`, flags: 64 }),
+          }
+        );
+      }
+    })();
+
+    return;
   }
+
+  // ---- Components ----
+  if (itx.type === InteractionType.MESSAGE_COMPONENT) {
+    res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
+
+    (async () => {
+      const message  = itx.message;
+      const customId = itx.data?.custom_id || '';
+      const userId   = itx.member?.user?.id || itx.user?.id || '';
+      const appId    = itx.application_id;
+      const token    = itx.token;
+      const msgId    = message?.id;
+
+      try {
+        // 查看名單（ephemeral）
+        if (customId === 'view_all') {
+          const state = (await loadState(msgId, message.content)) || extractStateFromContent(message.content);
+          const text = state ? renderViewAll(state) : '讀取名單失敗';
+          await discordFetch(
+            `https://discord.com/api/v10/webhooks/${appId}/${token}`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ content: text, flags: 64 }),
+            }
+          );
+          return;
+        }
+
+        // 管理入口：admin_manage（只有 owner/admin 可用）
+        if (customId === 'admin_manage') {
+          const state = (await loadState(msgId, message.content)) || extractStateFromContent(message.content);
+          if (!state) {
+            await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ content: '讀取狀態失敗', flags: 64 }),
+            });
+            return;
+          }
+          if (!isManager(itx, state)) {
+            await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ content: '你沒有管理權限', flags: 64 }),
+            });
+            return;
+          }
+          const rows = buildAdminPanel(state);
+          await discordFetch(
+            `https://discord.com/api/v10/webhooks/${appId}/${token}`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                content: '管理面板：先選成員，再按「踢出」或「移到第 N 團」。',
+                flags: 64,
+                components: rows,
+                allowed_mentions: { parse: [] },
+              }),
+            }
+          );
+          return;
+        }
+
+        // 管理：選擇成員（string select）
+        if (customId === 'admin_user') {
+          const v = itx.data?.values?.[0] || '';
+          const m = v.match(/^(\d+):(\d+)$/);
+          if (!m) {
+            await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ content: '選擇無效', flags: 64 }),
+            });
+            return;
+          }
+          const tgtUser = m[1];
+          const fromGrp = parseInt(m[2], 10);
+          // 暫存到管理上下文（key: msgId + operator）
+          await setEphemeral(`${msgId}:${userId}`, { target: tgtUser, from: fromGrp }, 120000);
+          await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: `已選擇：<@${tgtUser}>（第${fromGrp}團）。接著點「踢出」或「移到第 N 團」。`, flags: 64 }),
+          });
+          return;
+        }
+
+        // 管理：踢出/移組
+        const mv = customId.match(/^adm_move_(\d+)$/);
+        const isKick = customId === 'adm_kick';
+        if (isKick || mv) {
+          const ctx = await getEphemeral(`${msgId}:${userId}`);
+          if (!ctx?.target) {
+            await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ content: '請先在下拉選單選擇成員', flags: 64 }),
+            });
+            return;
+          }
+          const dest = isKick ? null : parseInt(mv[1], 10);
+
+          await withLock(`lock:${msgId}`, 3000, async () => {
+            let state = await loadState(msgId, message.content);
+            if (!state) state = extractStateFromContent(message.content);
+            if (!state) throw new Error('讀取狀態失敗');
+
+            if (!isManager(itx, state)) throw new Error('你沒有管理權限');
+
+            if (isKick) {
+              removeFromAll(state, ctx.target);
+            } else {
+              removeFromAll(state, ctx.target);
+              const r = applyJoin(state, dest, ctx.target);
+              if (!r.ok) throw new Error(`移動失敗：${r.msg}`);
+            }
+            state.version = (state.version || 0) + 1;
+            await saveState(msgId, state);
+
+            const content    = buildContentFromState(state);
+            const components = buildComponents(state);
+
+            await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`, {
+              method: 'PATCH',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ content, components, allowed_mentions: { parse: [] } }),
+            });
+          });
+
+          const done = isKick ? `已踢出 <@${ctx.target}>` : `已將 <@${ctx.target}> 移到第${dest}團`;
+          await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: done, flags: 64 }),
+          });
+          return;
+        }
+
+        // 一般 join / leave
+        const jm = customId.match(/^(join|leave)_(\d+)$/);
+        if (jm) {
+          const action  = jm[1];
+          const groupNo = parseInt(jm[2], 10);
+
+          await withLock(`lock:${msgId}`, 3000, async () => {
+            let state = await loadState(msgId, message.content);
+            if (!state) state = extractStateFromContent(message.content) || emptyState([5,5,5], '', false);
+
+            let result;
+            if (action === 'join') result = applyJoin(state, groupNo, userId);
+            else                   result = applyLeave(state, groupNo, userId);
+
+            if (result?.ok === false) {
+              await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ content: result.msg, flags: 64 }),
+              });
+            }
+
+            state.version = (state.version || 0) + 1;
+            await saveState(msgId, state);
+
+            const content    = buildContentFromState(state);
+            const components = buildComponents(state);
+
+            await discordFetch(`https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`, {
+              method: 'PATCH',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ content, components, allowed_mentions: { parse: [] } }),
+            });
+          });
+          return;
+        }
+      } catch (e) {
+        await discordFetch(
+          `https://discord.com/api/v10/webhooks/${appId}/${token}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: `處理失敗：${e.message || e}`, flags: 64 }),
+          }
+        );
+      }
+    })();
+
+    return;
+  }
+
+  return res.status(200).json({
+    type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+    data: { content: '未處理的互動類型', flags: 64 },
+  });
 }
