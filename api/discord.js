@@ -1,5 +1,5 @@
 // api/discord.js
-// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息
+// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定（修正從 ephemeral 觸發時無法更新原文）
 // - /cteam 同步回覆（type:4）
 // - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
 // - admin_open / admin_manage:pickmove 直接回覆 ephemeral（type:4, flags:64）避免重複
@@ -116,7 +116,18 @@ async function withLock(lockKey, ttlSec, fn) {
 /* =========================
  * 業務模型：state 結構
  * ========================= */
-function buildInitialState({ title, caps, multi, defaults, messageId, ownerId }) {
+/**
+ * state = {
+ *   title: string,
+ *   caps: number[],
+ *   members: { "1": string[], ... },
+ *   multi: boolean,
+ *   messageId: string|null,
+ *   ownerId: string,
+ *   token: string|null          // ★ 原始 /cteam 的 webhook token
+ * }
+ */
+function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, token }) {
   const groups = caps.length;
   const members = {};
   for (let i = 1; i <= groups; i++) members[String(i)] = [];
@@ -133,7 +144,15 @@ function buildInitialState({ title, caps, multi, defaults, messageId, ownerId })
       }
     }
   }
-  return { title: title || '', caps, members, multi: !!multi, messageId: messageId || null, ownerId: ownerId || '' };
+  return {
+    title: title || '',
+    caps,
+    members,
+    multi: !!multi,
+    messageId: messageId || null,
+    ownerId: ownerId || '',
+    token: token || null,       // ★
+  };
 }
 async function saveStateById(messageId, state) {
   if (!messageId) return;
@@ -306,7 +325,12 @@ export default async function handler(req, res) {
     const defaults = getOpt(opts, 'defaults') || '';
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
-    const initState = buildInitialState({ title, caps, multi, defaults, messageId: null, ownerId });
+    const initState = buildInitialState({
+      title, caps, multi, defaults,
+      messageId: null,
+      ownerId,
+      token: interaction.token,     // ★ 保存原始 webhook token
+    });
     await kvSet(`boot:${interaction.token}`, initState, 3600);
 
     return res.status(200).json({
@@ -327,10 +351,12 @@ export default async function handler(req, res) {
     const messageId = message?.id;
 
     // 先準備 state（供「直接回 ephemeral」的分支使用）
-    let baseState = await loadStateById(messageId)
-                  || await kvGet(`boot:${interaction.token}`)
-                  || fallbackStateFromContent(message?.content || '');
+    let baseState =
+        await loadStateById(messageId)
+     || await kvGet(`boot:${interaction.token}`)
+     || fallbackStateFromContent(message?.content || '');
     baseState.messageId = messageId;
+    if (!baseState.token) baseState.token = interaction.token;   // ★ 補 token
 
     // === 直接回 ephemeral（避免重複）===
     if (customId === 'admin_open') {
@@ -458,10 +484,12 @@ export default async function handler(req, res) {
 
     (async () => {
       try {
-        let state = await loadStateById(messageId)
-                || await kvGet(`boot:${interaction.token}`)
-                || fallbackStateFromContent(message?.content || '');
+        let state =
+            await loadStateById(messageId)
+         || await kvGet(`boot:${interaction.token}`)
+         || fallbackStateFromContent(message?.content || '');
         state.messageId = messageId;
+        if (!state.token) state.token = interaction.token;  // ★ 補 token
 
         const cid = customId;
 
@@ -586,7 +614,11 @@ async function patchOriginal(interaction, state) {
   const newContent = buildMessageText(state);
   const newComponents = buildMainButtons(state.caps.length);
 
-  const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`;
+  // ★ 使用「原始 /cteam 的 webhook token」+ messageId，無論從哪個互動來都能更新原文
+  const token = state.token || interaction.token;
+  const msgId = state.messageId; // components 互動一定會有
+  const url = `https://discord.com/api/v10/webhooks/${interaction.application_id}/${token}/messages/${msgId}`;
+
   const r = await fetch(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -650,5 +682,5 @@ function fallbackStateFromContent(content) {
     caps.push(12,12,12);
     members["1"] = []; members["2"] = []; members["3"] = [];
   }
-  return { title: '', caps, members, multi: false, messageId: null, ownerId: '' };
+  return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null }; // ★ token:null
 }
