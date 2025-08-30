@@ -1,9 +1,9 @@
-// api/discord.js — 方案A + 加強偵錯 + PATCH 失敗自動 followup
-// - /cteam：公開 → defer → 先 PATCH @original，失敗/逾時就 follow-up
+// api/discord.js — 方案A（/cteam 直接回最終訊息）+ 加強偵錯
+// - /cteam：直接回最終內容（type:4），不再使用 defer + PATCH，避免卡在「正在思考…」
 // - /myteams、/leaveall：ephemeral → defer → PATCH @original
-// - 按鈕：最多 5 列（每列 ≤5 顆），支援 12 團
-// - 重要 log：'hit /cteam vA'、'cteam parsed caps ...'、'patch ok/failed/error' 等
-// - fallback 不再回 OK，改回 DEBUG 訊息，方便判斷是否跑到正確程式
+// - 按鈕：最多 5 列（每列 ≤ 5 顆），最多支援 12 團；更新仍用 PATCH（含逾時保險）
+// - 重要 log：'hit /cteam vB immediate'、'patch ok/failed/error' 等
+// - fallback 不再回 OK，改回 DEBUG 訊息
 
 import {
   InteractionType,
@@ -13,10 +13,11 @@ import {
 
 export const config = { runtime: "nodejs" };
 
-// 版本戳，方便辨識目前部署
+// 部署版本戳
 const VERSION =
   "dbg-" +
-  new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 12) + "-" +
+  new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 12) +
+  "-" +
   (process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) || "local");
 
 /* ================= utils ================= */
@@ -142,34 +143,40 @@ async function buildSortedLabelList(guildId, ids) {
   return list.sort((a, b) => collator.compare(a, b));
 }
 
-/* -------- webhook helpers（含逾時＆失敗回傳） -------- */
+/* -------- webhook helpers（含逾時保險） -------- */
 async function patchOriginal(appId, token, body, tag = "") {
-  const ac = new AbortController();
-  const to = setTimeout(() => ac.abort(), 3500); // 3.5s 超時，避免卡在 thinking
-  try {
-    console.log("cteam start patch", tag);
-    const resp = await fetch(
-      `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: ac.signal,
-      }
-    );
-    clearTimeout(to);
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => "<no body>");
-      console.error("patch failed", tag, resp.status, txt);
-      return false;
+  console.log("cteam start patch", tag);
+
+  // 真正的 PATCH 請求
+  const req = fetch(
+    `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }
-    console.log("patch ok", tag, resp.status);
+  )
+    .then(async (resp) => {
+      const text = await resp.text().catch(() => "<no body>");
+      return { ok: resp.ok, status: resp.status, text };
+    })
+    .catch((e) => ({ ok: false, status: 0, text: String(e || "fetch error") }));
+
+  // 逾時保險（3.5s）
+  const timeout = new Promise((resolve) =>
+    setTimeout(() => resolve({ ok: false, status: -1, text: "timeout" }), 3500)
+  );
+
+  const ans = await Promise.race([req, timeout]);
+
+  if (ans.ok) {
+    console.log("patch ok", tag, ans.status);
     return true;
-  } catch (e) {
-    console.error("patch error", tag, e?.name || "", e?.message || e);
-    return false;
   }
+  console.error("patch failed/error", tag, ans.status, ans.text);
+  return false;
 }
+
 async function followup(appId, token, body, tag = "") {
   const resp = await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
     method: "POST",
@@ -208,11 +215,9 @@ export default async function handler(req, res) {
     const name = i.data?.name;
     console.log("slash name:", name);
 
-    // /cteam
+    // /cteam：直接回最終內容（type:4）
     if (name === "cteam") {
-      console.log("hit /cteam vA", { VERSION });
-      // 先回 defer（公開）
-      res.status(200).json({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+      console.log("hit /cteam vB immediate", { VERSION });
 
       try {
         const capsRaw    = i.data.options?.find(o => o.name === "caps")?.value ?? "12,12,12";
@@ -224,11 +229,10 @@ export default async function handler(req, res) {
 
         // 上限：最多 12 團（2*N + 1 ≤ 25 顆按鈕）
         if (!caps.length || caps.length > 12) {
-          await followup(i.application_id, i.token, {
-            content: `名額格式錯誤，或團數過多（最多 12 團）。 [${VERSION}]`,
-            flags: 64,
-          }, "cteam-err-caps");
-          return;
+          return res.status(200).json({
+            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+            data: { content: `名額格式錯誤，或團數過多（最多 12 團）。 [${VERSION}]`, flags: 64 }
+          });
         }
 
         let content = buildContentFromCaps(caps);
@@ -246,20 +250,20 @@ export default async function handler(req, res) {
           allowed_mentions: { parse: [] },
         };
 
-        // 先 PATCH；失敗/逾時就 follow-up
-        const ok = await patchOriginal(i.application_id, i.token, body, "cteam-main");
-        if (!ok) await followup(i.application_id, i.token, body, "cteam-fallback-post");
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: body,
+        });
       } catch (e) {
         console.error("cteam error", e);
-        await followup(i.application_id, i.token, {
-          content: `建立訊息時發生錯誤。 [${VERSION}]`,
-          flags: 64,
-        }, "cteam-catch");
+        return res.status(200).json({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: { content: `建立訊息時發生錯誤。 [${VERSION}]`, flags: 64 }
+        });
       }
-      return;
     }
 
-    // /myteams
+    // /myteams（ephemeral）
     if (name === "myteams") {
       console.log("hit /myteams", { VERSION });
       res.status(200).json({
@@ -318,7 +322,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // /leaveall
+    // /leaveall（ephemeral）
     if (name === "leaveall") {
       console.log("hit /leaveall", { VERSION });
       res.status(200).json({
@@ -348,7 +352,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // 按鈕
+  // 按鈕互動
   if (i.type === InteractionType.MESSAGE_COMPONENT) {
     const customId = i.data?.custom_id;
     console.log("component", { customId, VERSION });
