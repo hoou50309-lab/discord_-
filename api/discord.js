@@ -160,6 +160,22 @@ async function loadDefaultsFromAttachment(interaction, optionName = 'defaults') 
 }
 
 /* =========================
+ * /cteam 參數處理
+ * ========================= */
+function getOpt(opts, name) { return opts?.find(o => o.name === name)?.value; }
+
+// 解析 caps 參數
+function parseCaps(opts) {
+  const raw = getOpt(opts, 'caps');
+  if (!raw) return [12, 12, 12]; // 如果沒有指定 caps，則預設每個團隊12個名額
+  const arr = String(raw)
+    .split(',')
+    .map(s => parseInt(s.trim(), 10))
+    .filter(n => Number.isInteger(n) && n >= 0); // 過濾掉非正整數的值
+  return arr.length ? arr : [12, 12, 12]; // 如果無效的 caps，則返回預設值
+}
+
+/* =========================
  * /cteam 互動處理
  * ========================= */
 export default async function handler(req, res) {
