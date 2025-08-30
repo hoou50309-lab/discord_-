@@ -1,5 +1,5 @@
 // api/discord.js
-// ========= 高速  & 穩定版 =========
+// ========= 高速 & 穩定版 =========
 // - FAST_UPDATE: 先試同步計算 + 回 UPDATE_MESSAGE（type:7）=> 1 次往返；失敗再退回 defer+patch。
 // - 支援 GET/HEAD: 給 Vercel Cron / 健康檢查，避免冷啟動。
 // - Upstash Redis (可選) 作分散式鎖；沒有也能跑（會退回本地 latch）。
