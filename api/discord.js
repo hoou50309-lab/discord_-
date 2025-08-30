@@ -1,5 +1,5 @@
 // api/discord.js
-// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定 + Bot Token 後援
+// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定 + Bot Token 後援 + defaults_file/CSV
 // - /cteam 同步回覆（type:4）
 // - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
 // - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
@@ -10,7 +10,7 @@ import {
   InteractionType,
   InteractionResponseType,
   verifyKey,
-} from 'discord-interactions';
+} from 'discord-interactions'
 
 /* =========================
  * 環境與開關
@@ -113,6 +113,61 @@ async function withLock(lockKey, ttlSec, fn) {
 }
 
 /* =========================
+ * 附件處理：讀取 / CSV 轉換
+ * ========================= */
+// 取得 slash option 的附件物件（從 resolved.attachments 取）
+function getAttachment(interaction, optName) {
+  const opt = interaction?.data?.options?.find(o => o.name === optName);
+  if (!opt) return null;
+  const id = opt.value;
+  return interaction?.data?.resolved?.attachments?.[id] || null;
+}
+
+// 下載附件文字；預設上限 200KB
+async function readAttachmentText(att, maxBytes = 200 * 1024) {
+  try {
+    if (!att?.url) return null;
+    if (att.size && att.size > maxBytes) return null;
+    const r = await fetch(att.url, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.text();
+  } catch { return null; }
+}
+
+// 將 CSV 轉成 "group: <@id> <@id2>" 的 defaults 文字；支援表頭 group,member_id
+function csvToDefaults(csvText) {
+  const lines = String(csvText || "").trim().split(/\r?\n/);
+  if (!lines.length) return "";
+  const outMap = new Map(); // group -> Set(ids)
+  let start = 0;
+  const h = (lines[0] || "").toLowerCase();
+  if (h.includes("group") && (h.includes("member") || h.includes("id"))) {
+    start = 1;
+  }
+  for (let i = start; i < lines.length; i++) {
+    const row = lines[i].trim();
+    if (!row) continue;
+    const parts = row.split(",").map(s => s.trim());
+    if (parts.length < 2) continue;
+    const g = parseInt(parts[0], 10);
+    if (!Number.isInteger(g) || g <= 0) continue;
+    const rest = parts.slice(1).join(",");
+    const m = rest.match(/<@!?(\d+)>|@?(\d{15,21})/);
+    const id = m ? (m[1] || m[2]) : null;
+    if (!id) continue;
+    if (!outMap.has(g)) outMap.set(g, new Set());
+    outMap.get(g).add(id);
+  }
+  const groups = Array.from(outMap.keys()).sort((a, b) => a - b);
+  const out = [];
+  for (const g of groups) {
+    const ids = Array.from(outMap.get(g));
+    out.push(`${g}: ${ids.map(x => `<@${x}>`).join(" ")}`);
+  }
+  return out.join("\n");
+}
+
+/* =========================
  * 業務模型：state 結構
  * ========================= */
 /**
@@ -137,7 +192,10 @@ function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, t
       if (!m) continue;
       const idx = parseInt(m[1], 10);
       if (!members[String(idx)]) continue;
-      const ids = Array.from(m[2].matchAll(/<@!?(\d+)>/g)).map(x => x[1]);
+      // 支援 <@id>、@id、純數字
+      const ids = Array.from(
+        String(m[2]).matchAll(/<@!?(\d+)>|@?(\d{15,21})/g)
+      ).map(x => x[1] || x[2]).filter(Boolean);
       for (const id of ids) {
         if (caps[idx - 1] > 0) { members[String(idx)].push(id); caps[idx - 1] -= 1; }
       }
@@ -338,8 +396,24 @@ export default async function handler(req, res) {
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
     const title = getOpt(opts, 'title') || '';
-    const defaults = getOpt(opts, 'defaults') || '';
+    let defaults = getOpt(opts, 'defaults') || '';
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
+
+    // 若有上傳 defaults_file，優先使用檔案（支援 csv / 純文字）
+    const defAtt = getAttachment(interaction, 'defaults_file');
+    if (defAtt) {
+      const txt = await readAttachmentText(defAtt);
+      if (txt != null) {
+        const name = (defAtt.filename || '').toLowerCase();
+        const looksCsv = name.endsWith('.csv') || /,/.test((txt.split(/\r?\n/)[0] || ''));
+        if (looksCsv) {
+          const converted = csvToDefaults(txt);
+          if (converted) defaults = converted;
+        } else {
+          defaults = String(txt).replace(/\r\n/g, '\n').trim();
+        }
+      }
+    }
 
     const initState = buildInitialState({
       title, caps, multi, defaults,
@@ -494,7 +568,7 @@ export default async function handler(req, res) {
           data: { content: `處理失敗：${String(e?.message || '未知錯誤')}`, flags: 64 }
         });
       }
-      return; // 理論到不了這
+      return;
     }
 
     // === 快速路徑：join/leave 嘗試在同次請求內完成並 UPDATE_MESSAGE ===
