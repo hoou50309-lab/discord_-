@@ -5,7 +5,7 @@
 // - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
-// - ★ Discord 健康檢查可用 HEAD/GET：沒簽章→200；有簽章→驗簽
+// - ★ Discord 健康檢查可用 HEAD/GET/OPTIONS：一律 200（不驗簽）
 // - ★ 管理選單選項顯示暱稱/顯示名稱（需要 BOT_TOKEN；自動快取 24h）
 // - ★ 按鈕改為「兩團同一行」：最多 5 行，每行最多 5 元件 → 最多支援 10 團 + 1 管理鍵
 
@@ -319,7 +319,6 @@ function buildMainButtons(state) {
   const totalGroups = Math.min(state.caps.length, 10); // 兩團/行 + 管理鍵 => 最多 10 團
 
   for (let i = 1; i <= totalGroups; i++) {
-    // 若再放一團會超過 5 個元件就換行
     if (row.length + 2 > maxPerRow || groupsInRow === 2) pushRow();
 
     row.push({ type: 2, style: 3, custom_id: `join_${i}__m${multiFlag}`, label: `加入第${numToHan(i)}團` });
@@ -327,12 +326,10 @@ function buildMainButtons(state) {
     groupsInRow += 1;
   }
 
-  // 將管理鍵塞在最後一行（若剛好滿行則另起新行）
   if (row.length + 1 > maxPerRow) pushRow();
   row.push({ type: 2, style: 1, custom_id: 'admin_open', label: '管理名單（踢人 / 移組）' });
   pushRow();
 
-  // 最多 5 行保護（理論上 totalGroups=10 已受控）
   return rows.slice(0, maxRows);
 }
 
@@ -446,19 +443,15 @@ function hasAdmin(interaction, state) {
  * 互動處理
  * ========================= */
 export default async function handler(req, res) {
-  // ===== Discord 健康檢查 / 探測 =====
-  if (req.method === 'HEAD' || req.method === 'GET') {
+  // ===== 健康檢查 / 探測（不驗簽，直接 200，避免被自動移除）=====
+  if (req.method === 'HEAD' || req.method === 'GET' || req.method === 'OPTIONS') {
     res.setHeader('Cache-Control', 'no-store');
-    const sig = req.headers['x-signature-ed25519'];
-    const ts  = req.headers['x-signature-timestamp'];
-    if (!sig || !ts) return res.status(200).send('ok');
-    try {
-      const ok = verifyKey('', sig, ts, PUBLIC_KEY);
-      if (!ok) return res.status(401).send('invalid request signature');
-    } catch {
-      return res.status(401).send('invalid request signature');
-    }
-    return res.status(200).send('ok');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // 基本 CORS（OPTIONS 預檢時也能通過）
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    return res.status(200).end();
   }
 
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
@@ -532,7 +525,7 @@ export default async function handler(req, res) {
   // MESSAGE_COMPONENT
   if (interaction.type === InteractionType.MESSAGE_COMPONENT) {
     const customId = interaction.data?.custom_id || '';
-    const userId = interaction.member?.user?.id || interaction.user?.id;
+    aconst userId = interaction.member?.user?.id || interaction.user?.id;
     const message = interaction.message;
     const messageId = message?.id;
     const channelId = message?.channel_id;
