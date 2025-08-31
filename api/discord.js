@@ -6,6 +6,7 @@
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
 // - ★ Discord 健康檢查可用 HEAD/GET：沒簽章→200；有簽章→驗簽
+// - ★ 管理選單選項顯示暱稱/顯示名稱（需要 BOT_TOKEN；自動快取 24h）
 
 import {
   InteractionType,
@@ -177,8 +178,7 @@ function normalizeTitleInput(s) {
   // 允許手打 \n / \r\n
   t = t.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
   // 允許各種「直線」作為分隔（前後空白可有可無）
-  t = t
-    .replace(/[ \t]*(?:\||｜|│)[ \t]*/g, '\n'); // ASCII |、全形｜、方框│
+  t = t.replace(/[ \t]*(?:\||｜|│)[ \t]*/g, '\n');
   // 清理多餘空白行
   t = t.replace(/\n{3,}/g, '\n\n').trim();
   return t;
@@ -238,6 +238,45 @@ async function loadStateById(messageId) {
 }
 
 /* =========================
+ * 顯示名稱（暱稱）查詢與快取
+ * ========================= */
+async function fetchMemberDisplayName(guildId, userId) {
+  // 快取 24h
+  const cacheKey = `name:${guildId}:${userId}`;
+  const cached = await kvGet(cacheKey);
+  if (cached) return cached;
+
+  if (!BOT_TOKEN || !guildId) return String(userId);
+
+  try {
+    const url = `https://discord.com/api/v10/guilds/${guildId}/members/${userId}`;
+    const r = await fetch(url, {
+      headers: { 'Authorization': `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' },
+      cache: 'no-store',
+    });
+    if (!r.ok) return String(userId);
+    const j = await r.json();
+    const name =
+      j.nick ||
+      j.user?.global_name ||
+      j.user?.username ||
+      String(userId);
+    await kvSet(cacheKey, name, 24 * 3600);
+    return name;
+  } catch {
+    return String(userId);
+  }
+}
+
+async function fetchManyDisplayNames(guildId, ids) {
+  const uniq = Array.from(new Set(ids)).slice(0, 25);
+  const names = await Promise.all(uniq.map(id => fetchMemberDisplayName(guildId, id)));
+  const map = new Map();
+  uniq.forEach((id, i) => map.set(id, names[i]));
+  return map;
+}
+
+/* =========================
  * 文本與 UI
  * ========================= */
 const hanMap = ['零','一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六'];
@@ -285,21 +324,38 @@ function buildMainButtons(state) {
   return rows;
 }
 
-function buildAdminPanelSelects(state) {
+// ★ 這裡改為 async，會把 label 換成暱稱/顯示名稱
+async function buildAdminPanelSelects(state, guildId) {
   const targetMid = state.messageId || '';
   const optionsKick = [];
   const optionsMovePick = [];
   const groups = state.caps.length;
+
+  // 蒐集所有出現的成員 ID，先批次抓名稱
+  const allIds = [];
+  for (let g = 1; g <= groups; g++) {
+    const arr = state.members[String(g)] || [];
+    for (const uid of arr) {
+      allIds.push(uid);
+      if (allIds.length >= 25) break;
+    }
+    if (allIds.length >= 25) break;
+  }
+  const nameMap = await fetchManyDisplayNames(guildId, allIds);
+
   outer:
   for (let g = 1; g <= groups; g++) {
     const arr = state.members[String(g)] || [];
     for (const uid of arr) {
-      const label = `第${numToHan(g)}團 - ${uid}`;
-      optionsKick.push({ label: `踢出 ${label}`, value: `kick:${g}:${uid}` });
-      optionsMovePick.push({ label: `移組（選人） ${label}`, value: `pick:${g}:${uid}` });
+      const disp = nameMap.get(uid) || uid;
+      const left = state.caps[g - 1];
+      const base = `第${numToHan(g)}團${left != null ? `（剩 ${left}）` : ''} - ${disp}`;
+      optionsKick.push({ label: `踢出 ${base}`, value: `kick:${g}:${uid}` });
+      optionsMovePick.push({ label: `移組（選人） ${base}`, value: `pick:${g}:${uid}` });
       if (optionsKick.length >= 25 || optionsMovePick.length >= 25) break outer;
     }
   }
+
   const components = [];
   if (optionsKick.length) {
     components.push({
@@ -384,9 +440,7 @@ export default async function handler(req, res) {
     res.setHeader('Cache-Control', 'no-store');
     const sig = req.headers['x-signature-ed25519'];
     const ts  = req.headers['x-signature-timestamp'];
-    // 不帶簽章：純健康檢查 → 200
     if (!sig || !ts) return res.status(200).send('ok');
-    // 帶簽章：仍要驗簽（GET/HEAD 沒有 body）
     try {
       const ok = verifyKey('', sig, ts, PUBLIC_KEY);
       if (!ok) return res.status(401).send('invalid request signature');
@@ -485,8 +539,6 @@ export default async function handler(req, res) {
      || await kvGet(`boot:${interaction.token}`) // 只有極早期第一下才可能命中
      || fallbackStateFromContent(message?.content || '');
     baseState.messageId = targetMessageId;
-    // 千萬不要用「這次互動的 token」覆蓋（ephemeral 會錯），保留既有 token
-    // if (!baseState.token) baseState.token = interaction.token;  // ← 刻意拿掉
 
     // === 管理面板：開啟 & 選人（直接 type:4 回 ephemeral）===
     if (customId === 'admin_open') {
@@ -496,13 +548,16 @@ export default async function handler(req, res) {
           data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
         });
       }
-      // 確保後續選單上有 messageId
       baseState.messageId = targetMessageId;
+
+      // ⚠️ 這裡 await 以便把暱稱塞進選項 label
+      const comps = await buildAdminPanelSelects(baseState, interaction.guild_id);
+
       return res.status(200).json({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
         data: {
           content: '管理名單（踢人 / 移組）',
-          components: buildAdminPanelSelects(baseState),
+          components: comps,
           flags: 64,
           allowed_mentions: { parse: [] },
         }
@@ -644,7 +699,6 @@ export default async function handler(req, res) {
                 state.caps[idx - 1] += 1;
               }
 
-              // 第一次互動就把狀態跟 token 綁定在 messageId（若之前沒存過）
               if (!state.token) state.token = baseState.token || null;
               await saveStateById(targetMessageId, state);
               baseState = state;
