@@ -5,6 +5,7 @@
 // - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
+// - ★ Discord 健康檢查會用 HEAD/GET 且不帶簽章 → 本檔對 HEAD/GET 一律 200，不驗簽
 
 import {
   InteractionType,
@@ -377,17 +378,10 @@ function hasAdmin(interaction, state) {
  * 互動處理
  * ========================= */
 export default async function handler(req, res) {
-  if (req.method === 'HEAD') {
-    if (VERIFY_SIGNATURE) {
-      const signature = req.headers['x-signature-ed25519'];
-      const timestamp = req.headers['x-signature-timestamp'];
-      if (!signature || !timestamp) return res.status(401).send('missing signature');
-      try {
-        const ok = verifyKey('', signature, timestamp, PUBLIC_KEY);
-        if (!ok) return res.status(401).send('invalid request signature');
-      } catch { return res.status(401).send('invalid request signature'); }
-    }
-    return res.status(200).end();
+  // ★ Discord 健康檢查：HEAD/GET 一律回 200，不驗簽
+  if (req.method === 'HEAD' || req.method === 'GET') {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).send('ok');
   }
 
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
