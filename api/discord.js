@@ -141,9 +141,8 @@ function csvToDefaults(csvText) {
   const outMap = new Map(); // group -> Set(ids)
   let start = 0;
   const h = (lines[0] || "").toLowerCase();
-  if (h.includes("group") && (h.includes("member") || h.includes("id"))) {
-    start = 1;
-  }
+  if (h.includes("group") && (h.includes("member") || h.includes("id"))) start = 1;
+
   for (let i = start; i < lines.length; i++) {
     const row = lines[i].trim();
     if (!row) continue;
@@ -158,6 +157,7 @@ function csvToDefaults(csvText) {
     if (!outMap.has(g)) outMap.set(g, new Set());
     outMap.get(g).add(id);
   }
+
   const groups = Array.from(outMap.keys()).sort((a, b) => a - b);
   const out = [];
   for (const g of groups) {
@@ -226,9 +226,16 @@ async function loadStateById(messageId) {
 const hanMap = ['零','一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六'];
 const numToHan = n => hanMap[n] ?? String(n);
 
+// ★ 改成支援多行標題：第一行粗體，其餘逐行顯示
 function buildMessageText(state) {
   const lines = [];
-  if (state.title) lines.push(`**${state.title}**`);
+  if (state.title) {
+    const parts = String(state.title).split('\n');
+    if (parts.length) {
+      lines.push(`**${parts[0]}**`);
+      if (parts.length > 1) lines.push(...parts.slice(1));
+    }
+  }
   lines.push('目前名單：');
   const groups = state.caps.length;
   for (let i = 1; i <= groups; i++) {
@@ -780,14 +787,35 @@ function parseCaps(opts) {
 }
 
 /* =========================
- * 從訊息內容 fallback
+ * 從訊息內容 fallback（含標題還原）
  * ========================= */
+
+// ★ 從訊息文字擷取 title（支援多行、去掉第一行的 **粗體**）
+function parseTitleFromContent(content) {
+  const lines = String(content || '').split('\n');
+  const idx = lines.findIndex(l => l.trim() === '目前名單：');
+  if (idx <= 0) return '';
+  const header = lines.slice(0, idx)
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (!header.length) return '';
+  header[0] = header[0].replace(/^\*\*(.+?)\*\*$/, '$1').trim();
+  return header.join('\n');
+}
+
 function fallbackStateFromContent(content) {
   const lines = String(content || '').split('\n');
+
+  // 先抓回標題
+  const title = parseTitleFromContent(content);
+
+  // 從「目前名單：」之後開始解析群組
+  const start = Math.max(0, lines.findIndex(l => l.trim() === '目前名單：') + 1);
+
   const caps = [];
   const members = {};
   let groupIdx = 0;
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = start; i < lines.length; i++) {
     const s = lines[i].trim();
     const m = s.match(/^第(.+?)團（-(\d+)）$/);
     if (m) {
@@ -802,8 +830,8 @@ function fallbackStateFromContent(content) {
     caps.push(12,12,12);
     members["1"] = []; members["2"] = []; members["3"] = [];
   }
-  // 注意：這裡 multi 無法從文字還原，之後會靠 join custom_id 補回來
-  return { title: '', caps, members, multi: false, messageId: null, ownerId: '', token: null };
+  // 注意：multi 無法從文字還原，之後會靠 join custom_id 補回來
+  return { title, caps, members, multi: false, messageId: null, ownerId: '', token: null };
 }
 
 // 確保能讀到 raw body（Next.js API Route）
