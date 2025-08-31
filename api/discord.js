@@ -525,7 +525,7 @@ export default async function handler(req, res) {
   // MESSAGE_COMPONENT
   if (interaction.type === InteractionType.MESSAGE_COMPONENT) {
     const customId = interaction.data?.custom_id || '';
-    aconst userId = interaction.member?.user?.id || interaction.user?.id;
+    const userId = interaction.member?.user?.id || interaction.user?.id;
     const message = interaction.message;
     const messageId = message?.id;
     const channelId = message?.channel_id;
