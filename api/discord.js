@@ -168,6 +168,21 @@ function csvToDefaults(csvText) {
 }
 
 /* =========================
+ * 標題處理：允許以 ' | ' / '｜' / 字串 '\n' 換行
+ * ========================= */
+function normalizeTitleInput(s) {
+  if (!s) return '';
+  let t = String(s);
+  // 允許手打 \n / \r\n
+  t = t.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+  // 允許「空白 | 空白」或「空白 ｜ 空白」當換行
+  t = t.replace(/\s\|\s/g, '\n').replace(/\s｜\s/g, '\n');
+  // 清理多餘空白行
+  t = t.replace(/\n{3,}/g, '\n\n').trim();
+  return t;
+}
+
+/* =========================
  * 業務模型：state 結構
  * ========================= */
 /**
@@ -226,7 +241,7 @@ async function loadStateById(messageId) {
 const hanMap = ['零','一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六'];
 const numToHan = n => hanMap[n] ?? String(n);
 
-// ★ 改成支援多行標題：第一行粗體，其餘逐行顯示
+// ★ 支援多行標題：第一行粗體，其餘逐行顯示
 function buildMessageText(state) {
   const lines = [];
   if (state.title) {
@@ -236,7 +251,7 @@ function buildMessageText(state) {
       if (parts.length > 1) lines.push(...parts.slice(1));
     }
   }
-  lines.push('目前名單：');
+  lines.push('\n目前名單：');
   const groups = state.caps.length;
   for (let i = 1; i <= groups; i++) {
     const arr = state.members[String(i)] || [];
@@ -402,7 +417,7 @@ export default async function handler(req, res) {
     const opts = interaction.data.options || [];
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
-    const title = getOpt(opts, 'title') || '';
+    const title = normalizeTitleInput(getOpt(opts, 'title') || ''); // ★ 套用換行處理
     let defaults = getOpt(opts, 'defaults') || '';
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
