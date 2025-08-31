@@ -15,6 +15,9 @@ import {
   verifyKey,
 } from 'discord-interactions'
 
+// 讓 Next/Vercel 不把此 route 靜態化（避免 GET 被快取導致健康檢查誤判）
+export const dynamic = 'force-dynamic'
+
 /* =========================
  * 環境與開關
  * ========================= */
@@ -294,11 +297,7 @@ function buildMessageText(state) {
 }
 
 /**
- * ★ 新版按鈕：兩團同一行
- * - Discord 限制：最多 5 行、每行 5 個元件 → 25 元件
- * - 一團 2 個按鈕（加入/離開）→ 每行最多塞 2 團（4 個）
- * - 管理鍵佔 1 個，會被塞在最後一行（若滿則另起新行）
- * - 因此最多可同一則訊息容納 10 團 + 管理鍵
+ * ★ 新版按鈕：兩團同一行（最多 10 團 + 管理鍵）
  */
 function buildMainButtons(state) {
   const multiFlag = state.multi ? '1' : '0';
@@ -316,7 +315,7 @@ function buildMainButtons(state) {
     }
   };
 
-  const totalGroups = Math.min(state.caps.length, 10); // 兩團/行 + 管理鍵 => 最多 10 團
+  const totalGroups = Math.min(state.caps.length, 10);
 
   for (let i = 1; i <= totalGroups; i++) {
     if (row.length + 2 > maxPerRow || groupsInRow === 2) pushRow();
@@ -333,7 +332,7 @@ function buildMainButtons(state) {
   return rows.slice(0, maxRows);
 }
 
-// ★ 這裡改為 async，會把 label 換成暱稱/顯示名稱
+// ★ 管理選單顯示暱稱/顯示名稱
 async function buildAdminPanelSelects(state, guildId) {
   const targetMid = state.messageId || '';
   const optionsKick = [];
@@ -440,23 +439,30 @@ function hasAdmin(interaction, state) {
 }
 
 /* =========================
+ * 健康檢查回應（不驗簽）
+ * ========================= */
+function okHealth(res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Robots-Tag', 'noindex');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  return res.status(200).end();
+}
+
+/* =========================
  * 互動處理
  * ========================= */
 export default async function handler(req, res) {
-  // ===== 健康檢查 / 探測（不驗簽，直接 200，避免被自動移除）=====
+  // 健康檢查 / 預檢：直接 200，避免被自動移除
   if (req.method === 'HEAD' || req.method === 'GET' || req.method === 'OPTIONS') {
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    // 基本 CORS（OPTIONS 預檢時也能通過）
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
-    return res.status(200).end();
+    return okHealth(res);
   }
 
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // ===== 互動請求（POST）：必須帶簽章 =====
+  // 互動請求（POST）：必須帶簽章
   const signature = req.headers['x-signature-ed25519'];
   const timestamp = req.headers['x-signature-timestamp'];
   if (!signature || !timestamp) {
@@ -478,7 +484,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ type: InteractionResponseType.PONG });
   }
 
-  // /cteam：同步回覆
+  // /cteam
   if (interaction.type === InteractionType.APPLICATION_COMMAND &&
       interaction.data?.name === 'cteam') {
 
@@ -489,6 +495,7 @@ export default async function handler(req, res) {
     let defaults = getOpt(opts, 'defaults') || '';
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
+    // defaults_file
     const defAtt = getAttachment(interaction, 'defaults_file');
     if (defAtt) {
       const txt = await readAttachmentText(defAtt);
@@ -541,7 +548,7 @@ export default async function handler(req, res) {
      || fallbackStateFromContent(message?.content || '');
     baseState.messageId = targetMessageId;
 
-    // === 管理面板：開啟 & 選人（直接 type:4 回 ephemeral）===
+    // 管理面板：開啟
     if (customId === 'admin_open') {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
@@ -593,7 +600,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // === 管理面板：真正執行（同步處理，直接回 ephemeral 成功訊息）===
+    // 管理面板：執行
     if (customId.startsWith('admin_manage:kick:') || customId.startsWith('admin_manage:to:')) {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
@@ -657,7 +664,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // === 快速路徑：join/leave 嘗試在同次請求內完成並 UPDATE_MESSAGE ===
+    // 快速路徑
     if (FAST_UPDATE) {
       try {
         const quick = await Promise.race([
@@ -732,7 +739,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // === 保險路徑（join/leave）===
+    // 保險路徑
     res.status(200).json({ type: InteractionResponseType.DEFERRED_UPDATE_MESSAGE });
 
     (async () => {
