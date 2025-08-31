@@ -2,10 +2,11 @@
   "functions": {
     "api/discord.js": {
       "maxDuration": 10
-    },
-    {
-    "api/cron.js": {
-      "maxDuration": 10
     }
-  }
+  },
+    {
+  "crons": [{
+    "path": "/api/cron",
+    "schedule": "0 10 * * *"
+  }]
 }
