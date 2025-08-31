@@ -7,6 +7,7 @@
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
 // - ★ Discord 健康檢查可用 HEAD/GET：沒簽章→200；有簽章→驗簽
 // - ★ 管理選單選項顯示暱稱/顯示名稱（需要 BOT_TOKEN；自動快取 24h）
+// - ★ 按鈕改為「兩團同一行」：最多 5 行，每行最多 5 元件 → 最多支援 10 團 + 1 管理鍵
 
 import {
   InteractionType,
@@ -117,15 +118,12 @@ async function withLock(lockKey, ttlSec, fn) {
 /* =========================
  * 附件處理：讀取 / CSV 轉換
  * ========================= */
-// 取得 slash option 的附件物件（從 resolved.attachments 取）
 function getAttachment(interaction, optName) {
   const opt = interaction?.data?.options?.find(o => o.name === optName);
   if (!opt) return null;
   const id = opt.value;
   return interaction?.data?.resolved?.attachments?.[id] || null;
 }
-
-// 下載附件文字；預設上限 200KB
 async function readAttachmentText(att, maxBytes = 200 * 1024) {
   try {
     if (!att?.url) return null;
@@ -135,12 +133,10 @@ async function readAttachmentText(att, maxBytes = 200 * 1024) {
     return await r.text();
   } catch { return null; }
 }
-
-// 將 CSV 轉成 "group: <@id> <@id2>" 的 defaults 文字；支援表頭 group,member_id
 function csvToDefaults(csvText) {
   const lines = String(csvText || "").trim().split(/\r?\n/);
   if (!lines.length) return "";
-  const outMap = new Map(); // group -> Set(ids)
+  const outMap = new Map();
   let start = 0;
   const h = (lines[0] || "").toLowerCase();
   if (h.includes("group") && (h.includes("member") || h.includes("id"))) start = 1;
@@ -175,11 +171,8 @@ function csvToDefaults(csvText) {
 function normalizeTitleInput(s) {
   if (!s) return '';
   let t = String(s);
-  // 允許手打 \n / \r\n
   t = t.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
-  // 允許各種「直線」作為分隔（前後空白可有可無）
   t = t.replace(/[ \t]*(?:\||｜|│)[ \t]*/g, '\n');
-  // 清理多餘空白行
   t = t.replace(/\n{3,}/g, '\n\n').trim();
   return t;
 }
@@ -195,7 +188,7 @@ function normalizeTitleInput(s) {
  *   multi: boolean,
  *   messageId: string|null,
  *   ownerId: string,
- *   token: string|null          // /cteam 當下的 webhook token（用於編輯原文）
+ *   token: string|null
  * }
  */
 function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, token }) {
@@ -209,7 +202,6 @@ function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, t
       if (!m) continue;
       const idx = parseInt(m[1], 10);
       if (!members[String(idx)]) continue;
-      // 支援 <@id>、@id、純數字
       const ids = Array.from(
         String(m[2]).matchAll(/<@!?(\d+)>|@?(\d{15,21})/g)
       ).map(x => x[1] || x[2]).filter(Boolean);
@@ -241,7 +233,6 @@ async function loadStateById(messageId) {
  * 顯示名稱（暱稱）查詢與快取
  * ========================= */
 async function fetchMemberDisplayName(guildId, userId) {
-  // 快取 24h
   const cacheKey = `name:${guildId}:${userId}`;
   const cached = await kvGet(cacheKey);
   if (cached) return cached;
@@ -267,7 +258,6 @@ async function fetchMemberDisplayName(guildId, userId) {
     return String(userId);
   }
 }
-
 async function fetchManyDisplayNames(guildId, ids) {
   const uniq = Array.from(new Set(ids)).slice(0, 25);
   const names = await Promise.all(uniq.map(id => fetchMemberDisplayName(guildId, id)));
@@ -303,25 +293,47 @@ function buildMessageText(state) {
   return lines.join('\n');
 }
 
-// 改為吃 state（把 multi 編進 join 的 custom_id，防止 fallback 遺失設定）
+/**
+ * ★ 新版按鈕：兩團同一行
+ * - Discord 限制：最多 5 行、每行 5 個元件 → 25 元件
+ * - 一團 2 個按鈕（加入/離開）→ 每行最多塞 2 團（4 個）
+ * - 管理鍵佔 1 個，會被塞在最後一行（若滿則另起新行）
+ * - 因此最多可同一則訊息容納 10 團 + 管理鍵
+ */
 function buildMainButtons(state) {
-  const groupCount = state.caps.length;
   const multiFlag = state.multi ? '1' : '0';
+  const maxRows = 5;
+  const maxPerRow = 5;
   const rows = [];
-  for (let i = 1; i <= groupCount; i++) {
-    rows.push({
-      type: 1,
-      components: [
-        { type: 2, style: 3, custom_id: `join_${i}__m${multiFlag}`, label: `加入第${numToHan(i)}團` },
-        { type: 2, style: 2, custom_id: `leave_${i}`, label: `離開第${numToHan(i)}團` },
-      ],
-    });
+  let row = [];
+  let groupsInRow = 0;
+
+  const pushRow = () => {
+    if (row.length) {
+      rows.push({ type: 1, components: row });
+      row = [];
+      groupsInRow = 0;
+    }
+  };
+
+  const totalGroups = Math.min(state.caps.length, 10); // 兩團/行 + 管理鍵 => 最多 10 團
+
+  for (let i = 1; i <= totalGroups; i++) {
+    // 若再放一團會超過 5 個元件就換行
+    if (row.length + 2 > maxPerRow || groupsInRow === 2) pushRow();
+
+    row.push({ type: 2, style: 3, custom_id: `join_${i}__m${multiFlag}`, label: `加入第${numToHan(i)}團` });
+    row.push({ type: 2, style: 2, custom_id: `leave_${i}`, label: `離開第${numToHan(i)}團` });
+    groupsInRow += 1;
   }
-  rows.push({
-    type: 1,
-    components: [{ type: 2, style: 1, custom_id: 'admin_open', label: '管理名單（踢人 / 移組）' }],
-  });
-  return rows;
+
+  // 將管理鍵塞在最後一行（若剛好滿行則另起新行）
+  if (row.length + 1 > maxPerRow) pushRow();
+  row.push({ type: 2, style: 1, custom_id: 'admin_open', label: '管理名單（踢人 / 移組）' });
+  pushRow();
+
+  // 最多 5 行保護（理論上 totalGroups=10 已受控）
+  return rows.slice(0, maxRows);
 }
 
 // ★ 這裡改為 async，會把 label 換成暱稱/顯示名稱
@@ -331,7 +343,6 @@ async function buildAdminPanelSelects(state, guildId) {
   const optionsMovePick = [];
   const groups = state.caps.length;
 
-  // 蒐集所有出現的成員 ID，先批次抓名稱
   const allIds = [];
   for (let g = 1; g <= groups; g++) {
     const arr = state.members[String(g)] || [];
@@ -481,11 +492,10 @@ export default async function handler(req, res) {
     const opts = interaction.data.options || [];
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
-    const title = normalizeTitleInput(getOpt(opts, 'title') || ''); // ★ 套用換行處理
+    const title = normalizeTitleInput(getOpt(opts, 'title') || '');
     let defaults = getOpt(opts, 'defaults') || '';
     const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
 
-    // 若有上傳 defaults_file，優先使用檔案（支援 csv / 純文字）
     const defAtt = getAttachment(interaction, 'defaults_file');
     if (defAtt) {
       const txt = await readAttachmentText(defAtt);
@@ -527,16 +537,14 @@ export default async function handler(req, res) {
     const messageId = message?.id;
     const channelId = message?.channel_id;
 
-    // 解析 custom_id 裡面的原文 messageId（admin 面板）
     const msgIdFromCid = customId.startsWith('admin_manage:')
       ? customId.split(':').slice(-1)[0]
       : null;
     const targetMessageId = msgIdFromCid || messageId;
 
-    // 先準備 state
     let baseState =
         await loadStateById(targetMessageId)
-     || await kvGet(`boot:${interaction.token}`) // 只有極早期第一下才可能命中
+     || await kvGet(`boot:${interaction.token}`)
      || fallbackStateFromContent(message?.content || '');
     baseState.messageId = targetMessageId;
 
@@ -550,7 +558,6 @@ export default async function handler(req, res) {
       }
       baseState.messageId = targetMessageId;
 
-      // ⚠️ 這裡 await 以便把暱稱塞進選項 label
       const comps = await buildAdminPanelSelects(baseState, interaction.guild_id);
 
       return res.status(200).json({
@@ -625,7 +632,6 @@ export default async function handler(req, res) {
             });
           }
 
-          // admin_manage:to:{uid}:{from}:{msgId}
           const seg = customId.split(':');
           const moveId = seg[2];
           const fromIdx = parseInt(seg[3], 10);
@@ -813,7 +819,6 @@ async function patchOriginal(interaction, state, channelId) {
       }),
     });
     if (r.ok) return;
-    // 失敗則繼續用 BOT_TOKEN 後援
     console.warn('webhook patch failed', r.status, await r.text());
   }
 
@@ -868,8 +873,6 @@ function parseCaps(opts) {
 /* =========================
  * 從訊息內容 fallback（含標題還原）
  * ========================= */
-
-// ★ 從訊息文字擷取 title（支援多行、去掉第一行的 **粗體**）
 function parseTitleFromContent(content) {
   const lines = String(content || '').split('\n');
   const idx = lines.findIndex(l => l.trim() === '目前名單：');
@@ -881,14 +884,11 @@ function parseTitleFromContent(content) {
   header[0] = header[0].replace(/^\*\*(.+?)\*\*$/, '$1').trim();
   return header.join('\n');
 }
-
 function fallbackStateFromContent(content) {
   const lines = String(content || '').split('\n');
 
-  // 先抓回標題
   const title = parseTitleFromContent(content);
 
-  // 從「目前名單：」之後開始解析群組
   const start = Math.max(0, lines.findIndex(l => l.trim() === '目前名單：') + 1);
 
   const caps = [];
@@ -909,7 +909,6 @@ function fallbackStateFromContent(content) {
     caps.push(12,12,12);
     members["1"] = []; members["2"] = []; members["3"] = [];
   }
-  // 注意：multi 無法從文字還原，之後會靠 join custom_id 補回來
   return { title, caps, members, multi: false, messageId: null, ownerId: '', token: null };
 }
 
