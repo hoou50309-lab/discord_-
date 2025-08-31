@@ -1,14 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/discord.js": {
-      "maxDuration": 10
-    }
+    "api/discord.js": { "maxDuration": 10 }
   },
   "crons": [
-    {
-      "path": "/api/discord",
-      "schedule": "*/10 * * * *"
-    }
+    { "path": "/api/cron", "schedule": "*/10 * * * *" }
   ]
 }
