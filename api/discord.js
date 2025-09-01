@@ -5,7 +5,7 @@
 // - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
-// - ★ Discord 健康檢查可用 HEAD/GET/OPTIONS：一律 200（不驗簽）
+// - ★ 健康檢查：HEAD/GET/OPTIONS 無簽章→200；若帶了簽章表頭→驗簽，不通過回 401
 // - ★ 管理選單選項顯示暱稱/顯示名稱（需要 BOT_TOKEN；自動快取 24h）
 // - ★ 按鈕改為「兩團同一行」：最多 5 行，每行最多 5 元件 → 最多支援 10 團 + 1 管理鍵
 
@@ -439,15 +439,28 @@ function hasAdmin(interaction, state) {
 }
 
 /* =========================
- * 健康檢查回應（不驗簽）
+ * 健康檢查（有簽章就驗、沒簽章 200）
  * ========================= */
-function okHealth(res) {
+function healthOrVerify(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Robots-Tag', 'noindex');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
+
+  const sig = req.headers['x-signature-ed25519'];
+  const ts  = req.headers['x-signature-timestamp'];
+
+  // 帶了互動簽章表頭就驗簽（GET/HEAD/OPTIONS 沒 body，以空字串驗）
+  if (sig && ts) {
+    try {
+      const ok = verifyKey('', sig, ts, PUBLIC_KEY);
+      if (!ok) return res.status(401).send('invalid request signature');
+    } catch {
+      return res.status(401).send('invalid request signature');
+    }
+  }
   return res.status(200).end();
 }
 
@@ -455,9 +468,9 @@ function okHealth(res) {
  * 互動處理
  * ========================= */
 export default async function handler(req, res) {
-  // 健康檢查 / 預檢：直接 200，避免被自動移除
+  // 健康檢查 / 預檢：無簽章→200；若帶簽章→驗簽
   if (req.method === 'HEAD' || req.method === 'GET' || req.method === 'OPTIONS') {
-    return okHealth(res);
+    return healthOrVerify(req, res);
   }
 
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
