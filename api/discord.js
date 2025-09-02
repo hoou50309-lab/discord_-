@@ -1,13 +1,10 @@
 // api/discord.js
-// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定 + Bot Token 後援 + defaults_file/CSV
-// - /cteam 同步回覆（type:4）
-// - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
-// - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
-// - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
-// - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
-// - ★ 健康檢查：HEAD/GET/OPTIONS 無簽章→200；若帶簽章表頭→驗簽，不通過回 401
-// - ★ 管理選單選項顯示暱稱/顯示名稱（需要 BOT_TOKEN；自動快取 24h）
-// - ★ 按鈕改為「兩團同一行」：最多 5 行，每行最多 5 元件 → 最多支援 10 團 + 1 管理鍵
+// 改版：
+// 1) 顯示格式統一為「第X團（剩 N）」；fallback 解析同時相容舊格式「（-N）」
+// 2) 文字區與 UI 的團數上限一致（MAX_GROUPS，預設 10）；超出時會提示未顯示數量
+// 3) 提取常數（MAX_GROUPS / STATE_TTL_SEC / MAX_ROWS / MAX_PER_ROW），便於調整
+// 4) 管理面板/一般互動皆加入 allowed_mentions: { parse: [] }（已存在者保留）
+// 5) 細節：fallback 解析更健壯；錯誤訊息更一致
 
 import {
   InteractionType,
@@ -39,10 +36,14 @@ const RURL = process.env.UPSTASH_REDIS_REST_URL || '';
 const RTOK = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const HAVE_REDIS = !!(RURL && RTOK);
 
-// 快速路徑參數
+// 可調整常數
 const FAST_UPDATE = true;
 const LOCK_TTL_SEC = 2;
 const FAST_TIMEOUT_MS = 2200;
+const STATE_TTL_SEC = 7 * 24 * 3600; // state 保存時間
+const MAX_GROUPS = Math.max(1, Math.min(10, parseInt(process.env.MAX_GROUPS || '10', 10))); // UI/文字上限一致
+const MAX_ROWS = 5;      // Discord 每訊息最多 5 行 action rows
+const MAX_PER_ROW = 5;   // 每行最多 5 個元件
 
 /* =========================
  * 小工具/基礎
@@ -225,7 +226,7 @@ function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, t
 }
 async function saveStateById(messageId, state) {
   if (!messageId) return;
-  await kvSet(`state:${messageId}`, state, 7 * 24 * 3600);
+  await kvSet(`state:${messageId}`, state, STATE_TTL_SEC);
 }
 async function loadStateById(messageId) {
   if (!messageId) return null;
@@ -286,12 +287,16 @@ function buildMessageText(state) {
     }
   }
   lines.push('\n目前名單：');
-  const groups = state.caps.length;
-  for (let i = 1; i <= groups; i++) {
+
+  const totalGroups = Math.min(state.caps.length, MAX_GROUPS);
+  for (let i = 1; i <= totalGroups; i++) {
     const arr = state.members[String(i)] || [];
     const mentions = arr.length ? arr.map(id => `<@${id}>`).join(' ') : '（無）';
-    lines.push(`第${numToHan(i)}團（-${state.caps[i - 1]}）`);
+    lines.push(`第${numToHan(i)}團（剩 ${state.caps[i - 1]}）`);
     lines.push(mentions);
+  }
+  if (state.caps.length > MAX_GROUPS) {
+    lines.push(`\n…尚有 ${state.caps.length - MAX_GROUPS} 團未顯示（受限 MAX_GROUPS=${MAX_GROUPS}）。`);
   }
   return lines.join('\n');
 }
@@ -301,8 +306,6 @@ function buildMessageText(state) {
  */
 function buildMainButtons(state) {
   const multiFlag = state.multi ? '1' : '0';
-  const maxRows = 5;
-  const maxPerRow = 5;
   const rows = [];
   let row = [];
   let groupsInRow = 0;
@@ -315,21 +318,26 @@ function buildMainButtons(state) {
     }
   };
 
-  const totalGroups = Math.min(state.caps.length, 10);
+  const totalGroups = Math.min(state.caps.length, MAX_GROUPS);
 
   for (let i = 1; i <= totalGroups; i++) {
-    if (row.length + 2 > maxPerRow || groupsInRow === 2) pushRow();
+    if (row.length + 2 > MAX_PER_ROW || groupsInRow === 2) pushRow();
 
     row.push({ type: 2, style: 3, custom_id: `join_${i}__m${multiFlag}`, label: `加入第${numToHan(i)}團` });
     row.push({ type: 2, style: 2, custom_id: `leave_${i}`, label: `離開第${numToHan(i)}團` });
     groupsInRow += 1;
+
+    if (rows.length >= MAX_ROWS) break; // 保護：不超過 5 行
   }
 
-  if (row.length + 1 > maxPerRow) pushRow();
-  row.push({ type: 2, style: 1, custom_id: 'admin_open', label: '管理名單（踢人 / 移組）' });
-  pushRow();
+  // 管理鍵放在最後一行（若滿 4 個按鈕，這行還剩 1 格）
+  if (row.length + 1 > MAX_PER_ROW) pushRow();
+  if (rows.length < MAX_ROWS) {
+    row.push({ type: 2, style: 1, custom_id: 'admin_open', label: '管理名單（踢人 / 移組）' });
+    pushRow();
+  }
 
-  return rows.slice(0, maxRows);
+  return rows.slice(0, MAX_ROWS);
 }
 
 // ★ 管理選單顯示暱稱/顯示名稱
@@ -337,7 +345,7 @@ async function buildAdminPanelSelects(state, guildId) {
   const targetMid = state.messageId || '';
   const optionsKick = [];
   const optionsMovePick = [];
-  const groups = state.caps.length;
+  const groups = Math.min(state.caps.length, MAX_GROUPS);
 
   const allIds = [];
   for (let g = 1; g <= groups; g++) {
@@ -356,7 +364,7 @@ async function buildAdminPanelSelects(state, guildId) {
     for (const uid of arr) {
       const disp = nameMap.get(uid) || uid;
       const left = state.caps[g - 1];
-      const base = `第${numToHan(g)}團${left != null ? `（剩 ${left}）` : ''} - ${disp}`;
+      const base = `第${numToHan(g)}團（剩 ${left}） - ${disp}`;
       optionsKick.push({ label: `踢出 ${base}`, value: `kick:${g}:${uid}` });
       optionsMovePick.push({ label: `移組（選人） ${base}`, value: `pick:${g}:${uid}` });
       if (optionsKick.length >= 25 || optionsMovePick.length >= 25) break outer;
@@ -398,7 +406,7 @@ async function buildAdminPanelSelects(state, guildId) {
 function buildMoveToSelect(state, userId, fromIdx) {
   const targetMid = state.messageId || '';
   const options = [];
-  const groups = state.caps.length;
+  const groups = Math.min(state.caps.length, MAX_GROUPS);
   for (let g = 1; g <= groups; g++) {
     if (g === fromIdx) continue;
     options.push({
@@ -566,7 +574,7 @@ export default async function handler(req, res) {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
+          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
       baseState.messageId = targetMessageId;
@@ -588,7 +596,7 @@ export default async function handler(req, res) {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
+          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
       const v = interaction.data.values?.[0] || '';
@@ -596,7 +604,7 @@ export default async function handler(req, res) {
       if (!m) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '無效的選項。', flags: 64 }
+          data: { content: '無效的選項。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
       const fromIdx = parseInt(m[1], 10);
@@ -618,7 +626,7 @@ export default async function handler(req, res) {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
+          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
 
@@ -671,7 +679,7 @@ export default async function handler(req, res) {
       } catch (e) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: `處理失敗：${String(e?.message || '未知錯誤')}`, flags: 64 }
+          data: { content: `處理失敗：${String(e?.message || '未知錯誤')}`, flags: 64, allowed_mentions: { parse: [] } }
         });
       }
       return;
@@ -808,7 +816,7 @@ export default async function handler(req, res) {
   // 其他互動
   return res.status(200).json({
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-    data: { content: '未處理的互動類型。', flags: 64 },
+    data: { content: '未處理的互動類型。', flags: 64, allowed_mentions: { parse: [] } },
   });
 }
 
@@ -878,9 +886,14 @@ async function followupEphemeral(interaction, text) {
 function getOpt(opts, name) { return opts?.find(o => o.name === name)?.value; }
 function parseCaps(opts) {
   const raw = getOpt(opts, 'caps');
-  if (!raw) return [12,12,12];
-  const arr = String(raw).split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n >= 0);
-  return arr.length ? arr : [12,12,12];
+  let arr = [];
+  if (raw) {
+    arr = String(raw).split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n >= 0);
+  }
+  if (!arr.length) arr = [12,12,12];
+  // 和 UI 一致，避免超過按鈕上限
+  if (arr.length > MAX_GROUPS) arr = arr.slice(0, MAX_GROUPS);
+  return arr;
 }
 
 /* =========================
@@ -909,10 +922,13 @@ function fallbackStateFromContent(content) {
   let groupIdx = 0;
   for (let i = start; i < lines.length; i++) {
     const s = lines[i].trim();
-    const m = s.match(/^第(.+?)團（-(\d+)）$/);
+    // 相容新舊格式：
+    // 新：第X團（剩 N）
+    // 旧：第X團（-N）
+    const m = s.match(/^第(.+?)團（(?:剩\s*)?(-?\d+)）$/);
     if (m) {
       groupIdx += 1;
-      caps.push(parseInt(m[2], 10));
+      caps.push(Math.max(0, parseInt(m[2], 10)));
       const next = (lines[i+1] || '').trim();
       const ids = Array.from(next.matchAll(/<@!?(\d+)>/g)).map(x => x[1]);
       members[String(groupIdx)] = ids;
@@ -920,7 +936,7 @@ function fallbackStateFromContent(content) {
   }
   if (caps.length === 0) {
     caps.push(12,12,12);
-    members["1"] = []; members["2"] = []; members["3"] = [];
+    members['1'] = []; members['2'] = []; members['3'] = [];
   }
   return { title, caps, members, multi: false, messageId: null, ownerId: '', token: null };
 }
