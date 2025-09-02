@@ -5,7 +5,7 @@
 // - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
 // - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
 // - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
-// - ★ 健康檢查：HEAD/GET/OPTIONS 無簽章→200；若帶了簽章表頭→驗簽，不通過回 401
+// - ★ 健康檢查：HEAD/GET/OPTIONS 無簽章→200；若帶簽章表頭→驗簽，不通過回 401
 // - ★ 管理選單選項顯示暱稱/顯示名稱（需要 BOT_TOKEN；自動快取 24h）
 // - ★ 按鈕改為「兩團同一行」：最多 5 行，每行最多 5 元件 → 最多支援 10 團 + 1 管理鍵
 
