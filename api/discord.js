@@ -1,37 +1,26 @@
 // api/discord.js
-// 穩定版 + 管理選單（踢人 / 移組）+ 修正重複貼訊息 + 原始 token 綁定 + Bot Token 後援 + defaults_file/CSV
-// - /cteam 同步回覆（type:4）
-// - join/leave：快速路徑 2.2s 內直接 UPDATE_MESSAGE（type:7），否則走 defer+PATCH
-// - admin_open / admin_manage:* 直接回覆 ephemeral（type:4, flags:64）→ 點了就有反應
-// - 狀態優先 Redis（UPSTASH_REDIS_REST_URL/TOKEN），無則記憶體
-// - VERIFY_SIGNATURE 預設依環境：Production=true、其餘=false（可被環境變數覆寫）
-// - ★ 健康檢查：HEAD/GET/OPTIONS 無簽章→200；若帶簽章表頭→驗簽，不通過回 401
-// - ★ 管理選單選項顯示暱稱/顯示名稱（需要 BOT_TOKEN；自動快取 24h）
-// - ★ 按鈕改為「兩團同一行」：最多 5 行，每行最多 5 元件 → 最多支援 10 團 + 1 管理鍵
+// 改版：
+// 1) 顯示格式統一為「第X團（剩 N）」；fallback 解析同時相容舊格式「（-N）」
+// 2) 文字區與 UI 的團數上限一致（MAX_GROUPS，預設 10）；超出時會提示未顯示數量
+// 3) 提取常數（MAX_GROUPS / STATE_TTL_SEC / MAX_ROWS / MAX_PER_ROW），便於調整
+// 4) 管理面板/一般互動皆加入 allowed_mentions: { parse: [] }（已存在者保留）
+// 5) fallback 解析更健壯；錯誤訊息更一致
+// 6) 安全強化：Interactions endpoint 嚴格驗簽（GET/HEAD/OPTIONS/POST），時間窗 ±SIG_WINDOW_SEC，缺簽或錯簽一律 401。
+//    外部健康檢查請改用 /api/cron 或獨立 /api/health。
 
 import {
   InteractionType,
   InteractionResponseType,
   verifyKey,
-} from 'discord-interactions'
+} from 'discord-interactions';
 
-// 讓 Next/Vercel 不把此 route 靜態化（避免 GET 被快取導致健康檢查誤判）
-export const dynamic = 'force-dynamic'
+// 讓 Next/Vercel 不把此 route 靜態化
+export const dynamic = 'force-dynamic';
 
 /* =========================
  * 環境與開關
  * ========================= */
-const _resolvedVerify =
-  (process.env.VERIFY_SIGNATURE ??
-   ((process.env.VERCEL === '1' ||
-     process.env.VERCEL_ENV === 'production' ||
-     process.env.NODE_ENV === 'production')
-     ? 'true'
-     : 'false'));
-const VERIFY_SIGNATURE = String(_resolvedVerify).toLowerCase() === 'true';
-
 const PUBLIC_KEY = process.env.PUBLIC_KEY || '';
-
 const APP_ID = process.env.APP_ID || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 
@@ -39,10 +28,17 @@ const RURL = process.env.UPSTASH_REDIS_REST_URL || '';
 const RTOK = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const HAVE_REDIS = !!(RURL && RTOK);
 
-// 快速路徑參數
+// 可調整常數
 const FAST_UPDATE = true;
 const LOCK_TTL_SEC = 2;
 const FAST_TIMEOUT_MS = 2200;
+const STATE_TTL_SEC = 7 * 24 * 3600; // state 保存時間
+const MAX_GROUPS = Math.max(1, Math.min(10, parseInt(process.env.MAX_GROUPS || '10', 10))); // UI/文字上限一致
+const MAX_ROWS = 5;      // Discord 每訊息最多 5 行 action rows
+const MAX_PER_ROW = 5;   // 每行最多 5 個元件
+// 安全參數
+const STRICT_UA = String(process.env.STRICT_UA || '0') === '1'; // 嚴格要求 Discord UA（可選，預設關閉）
+const SIG_WINDOW_SEC = parseInt(process.env.SIG_WINDOW_SEC || '300', 10); // 簽章時間窗（秒）
 
 /* =========================
  * 小工具/基礎
@@ -80,7 +76,7 @@ async function kvGet(key) {
     const enc = encodeURIComponent;
     const j = await redisFetch(`GET/${enc(key)}`);
     if (!j || j.result == null) return null;
-    try { return JSON.parse(Buffer.from(j.result, 'base64').toString('utf8')); } catch { return null; }
+    try { return JSON.parse(Buffer.from(j.result, 'base64').toString('utf8')); } catch (e) { return null; }
   } else {
     const it = memKV.get(key);
     if (!it) return null;
@@ -104,12 +100,12 @@ async function withLock(lockKey, ttlSec, fn) {
     let ok = false;
     try {
       const r = await redisFetch(`SETNX/${enc(key)}/${enc(val)}`);
-      ok = !!r?.result;
-    } catch (_) {}
+      ok = !!(r && r.result);
+    } catch (e) {}
     if (!ok) throw new Error('lock busy');
-    try { await redisFetch(`EXPIRE/${enc(key)}/${ttlSec}`); } catch {}
+    try { await redisFetch(`EXPIRE/${enc(key)}/${ttlSec}`); } catch (e) {}
     try { return await fn(); }
-    finally { try { await redisFetch(`DEL/${enc(key)}`); } catch {} }
+    finally { try { await redisFetch(`DEL/${enc(key)}`); } catch (e) {} }
   } else {
     if (memKV.has(key)) throw new Error('lock busy');
     memKV.set(key, { val, exp: Date.now() + ttlSec * 1000 });
@@ -119,22 +115,51 @@ async function withLock(lockKey, ttlSec, fn) {
 }
 
 /* =========================
+ * 安全工具：UA/IP/日誌
+ * ========================= */
+function getClientIp(req) {
+  try {
+    return (
+      req.headers['x-vercel-forwarded-for'] ||
+      req.headers['x-forwarded-for'] ||
+      (req.socket && req.socket.remoteAddress) ||
+      ''
+    );
+  } catch (e) { return ''; }
+}
+function isLikelyDiscordUA(req) {
+  const ua = String((req.headers && req.headers['user-agent']) || '');
+  return /Discord/i.test(ua) || /Interactions/i.test(ua);
+}
+function logDeny(req, reason) {
+  try {
+    console.warn('[deny]', {
+      method: req.method,
+      url: req.url,
+      ua: String((req.headers && req.headers['user-agent']) || ''),
+      ip: String(getClientIp(req)),
+      reason,
+    });
+  } catch (e) {}
+}
+
+/* =========================
  * 附件處理：讀取 / CSV 轉換
  * ========================= */
 function getAttachment(interaction, optName) {
-  const opt = interaction?.data?.options?.find(o => o.name === optName);
+  const opt = interaction && interaction.data && interaction.data.options && interaction.data.options.find(o => o.name === optName);
   if (!opt) return null;
   const id = opt.value;
-  return interaction?.data?.resolved?.attachments?.[id] || null;
+  return (interaction.data.resolved && interaction.data.resolved.attachments && interaction.data.resolved.attachments[id]) || null;
 }
 async function readAttachmentText(att, maxBytes = 200 * 1024) {
   try {
-    if (!att?.url) return null;
+    if (!att || !att.url) return null;
     if (att.size && att.size > maxBytes) return null;
     const r = await fetch(att.url, { cache: 'no-store' });
     if (!r.ok) return null;
     return await r.text();
-  } catch { return null; }
+  } catch (e) { return null; }
 }
 function csvToDefaults(csvText) {
   const lines = String(csvText || "").trim().split(/\r?\n/);
@@ -225,7 +250,7 @@ function buildInitialState({ title, caps, multi, defaults, messageId, ownerId, t
 }
 async function saveStateById(messageId, state) {
   if (!messageId) return;
-  await kvSet(`state:${messageId}`, state, 7 * 24 * 3600);
+  await kvSet(`state:${messageId}`, state, STATE_TTL_SEC);
 }
 async function loadStateById(messageId) {
   if (!messageId) return null;
@@ -251,13 +276,12 @@ async function fetchMemberDisplayName(guildId, userId) {
     if (!r.ok) return String(userId);
     const j = await r.json();
     const name =
-      j.nick ||
-      j.user?.global_name ||
-      j.user?.username ||
+      (j && j.nick) ||
+      (j && j.user && (j.user.global_name || j.user.username)) ||
       String(userId);
     await kvSet(cacheKey, name, 24 * 3600);
     return name;
-  } catch {
+  } catch (e) {
     return String(userId);
   }
 }
@@ -275,7 +299,7 @@ async function fetchManyDisplayNames(guildId, ids) {
 const hanMap = ['零','一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六'];
 const numToHan = n => hanMap[n] ?? String(n);
 
-// ★ 支援多行標題：第一行粗體，其餘逐行顯示
+// 支援多行標題：第一行粗體，其餘逐行顯示
 function buildMessageText(state) {
   const lines = [];
   if (state.title) {
@@ -286,23 +310,25 @@ function buildMessageText(state) {
     }
   }
   lines.push('\n目前名單：');
-  const groups = state.caps.length;
-  for (let i = 1; i <= groups; i++) {
+
+  const totalGroups = Math.min(state.caps.length, MAX_GROUPS);
+  for (let i = 1; i <= totalGroups; i++) {
     const arr = state.members[String(i)] || [];
     const mentions = arr.length ? arr.map(id => `<@${id}>`).join(' ') : '（無）';
-    lines.push(`第${numToHan(i)}團（-${state.caps[i - 1]}）`);
+    lines.push(`第${numToHan(i)}團（剩 ${state.caps[i - 1]}）`);
     lines.push(mentions);
+  }
+  if (state.caps.length > MAX_GROUPS) {
+    lines.push(`\n…尚有 ${state.caps.length - MAX_GROUPS} 團未顯示（受限 MAX_GROUPS=${MAX_GROUPS}）。`);
   }
   return lines.join('\n');
 }
 
 /**
- * ★ 新版按鈕：兩團同一行（最多 10 團 + 管理鍵）
+ * 新版按鈕：兩團同一行（最多 10 團 + 管理鍵）
  */
 function buildMainButtons(state) {
   const multiFlag = state.multi ? '1' : '0';
-  const maxRows = 5;
-  const maxPerRow = 5;
   const rows = [];
   let row = [];
   let groupsInRow = 0;
@@ -315,29 +341,34 @@ function buildMainButtons(state) {
     }
   };
 
-  const totalGroups = Math.min(state.caps.length, 10);
+  const totalGroups = Math.min(state.caps.length, MAX_GROUPS);
 
   for (let i = 1; i <= totalGroups; i++) {
-    if (row.length + 2 > maxPerRow || groupsInRow === 2) pushRow();
+    if (row.length + 2 > MAX_PER_ROW || groupsInRow === 2) pushRow();
 
     row.push({ type: 2, style: 3, custom_id: `join_${i}__m${multiFlag}`, label: `加入第${numToHan(i)}團` });
     row.push({ type: 2, style: 2, custom_id: `leave_${i}`, label: `離開第${numToHan(i)}團` });
     groupsInRow += 1;
+
+    if (rows.length >= MAX_ROWS) break; // 保護：不超過 5 行
   }
 
-  if (row.length + 1 > maxPerRow) pushRow();
-  row.push({ type: 2, style: 1, custom_id: 'admin_open', label: '管理名單（踢人 / 移組）' });
-  pushRow();
+  // 管理鍵放在最後一行（若滿 4 個按鈕，這行還剩 1 格）
+  if (row.length + 1 > MAX_PER_ROW) pushRow();
+  if (rows.length < MAX_ROWS) {
+    row.push({ type: 2, style: 1, custom_id: 'admin_open', label: '管理名單（踢人 / 移組）' });
+    pushRow();
+  }
 
-  return rows.slice(0, maxRows);
+  return rows.slice(0, MAX_ROWS);
 }
 
-// ★ 管理選單顯示暱稱/顯示名稱
+// 管理選單顯示暱稱/顯示名稱
 async function buildAdminPanelSelects(state, guildId) {
   const targetMid = state.messageId || '';
   const optionsKick = [];
   const optionsMovePick = [];
-  const groups = state.caps.length;
+  const groups = Math.min(state.caps.length, MAX_GROUPS);
 
   const allIds = [];
   for (let g = 1; g <= groups; g++) {
@@ -356,7 +387,7 @@ async function buildAdminPanelSelects(state, guildId) {
     for (const uid of arr) {
       const disp = nameMap.get(uid) || uid;
       const left = state.caps[g - 1];
-      const base = `第${numToHan(g)}團${left != null ? `（剩 ${left}）` : ''} - ${disp}`;
+      const base = `第${numToHan(g)}團（剩 ${left}） - ${disp}`;
       optionsKick.push({ label: `踢出 ${base}`, value: `kick:${g}:${uid}` });
       optionsMovePick.push({ label: `移組（選人） ${base}`, value: `pick:${g}:${uid}` });
       if (optionsKick.length >= 25 || optionsMovePick.length >= 25) break outer;
@@ -398,7 +429,7 @@ async function buildAdminPanelSelects(state, guildId) {
 function buildMoveToSelect(state, userId, fromIdx) {
   const targetMid = state.messageId || '';
   const options = [];
-  const groups = state.caps.length;
+  const groups = Math.min(state.caps.length, MAX_GROUPS);
   for (let g = 1; g <= groups; g++) {
     if (g === fromIdx) continue;
     options.push({
@@ -422,9 +453,9 @@ function buildMoveToSelect(state, userId, fromIdx) {
  * 權限
  * ========================= */
 function hasAdmin(interaction, state) {
-  const uid = interaction.member?.user?.id || interaction.user?.id;
-  if (uid && state?.ownerId && uid === state.ownerId) return true;
-  const p = interaction.member?.permissions;
+  const uid = (interaction.member && interaction.member.user && interaction.member.user.id) || (interaction.user && interaction.user.id);
+  if (uid && state && state.ownerId && uid === state.ownerId) return true;
+  const p = interaction.member && interaction.member.permissions;
   if (!p) return false;
   try {
     const perms = BigInt(p);
@@ -434,12 +465,12 @@ function hasAdmin(interaction, state) {
     if ((perms & ADMINISTRATOR) !== 0n) return true;
     if ((perms & MANAGE_GUILD) !== 0n) return true;
     if ((perms & MANAGE_MESSAGES) !== 0n) return true;
-  } catch {}
+  } catch (e) {}
   return false;
 }
 
 /* =========================
- * 健康檢查（有簽章就驗、沒簽章 200）
+ * 嚴格健康檢查（GET/HEAD/OPTIONS 也必須帶簽章）
  * ========================= */
 function healthOrVerify(req, res) {
   res.setHeader('Cache-Control', 'no-store');
@@ -449,17 +480,37 @@ function healthOrVerify(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
 
+  if (!PUBLIC_KEY) {
+    logDeny(req, 'missing public key');
+    return res.status(500).send('server misconfigured: missing PUBLIC_KEY');
+  }
+
   const sig = req.headers['x-signature-ed25519'];
   const ts  = req.headers['x-signature-timestamp'];
 
-  // 帶了互動簽章表頭就驗簽（GET/HEAD/OPTIONS 沒 body，以空字串驗）
-  if (sig && ts) {
-    try {
-      const ok = verifyKey('', sig, ts, PUBLIC_KEY);
-      if (!ok) return res.status(401).send('invalid request signature');
-    } catch {
+  if (!sig || !ts) {
+    logDeny(req, 'missing signature headers');
+    return res.status(401).send('missing signature');
+  }
+
+  // 時間窗（避免重放）
+  const now = Math.floor(Date.now() / 1000);
+  const t = parseInt(String(ts), 10);
+  if (!Number.isFinite(t) || Math.abs(now - t) > SIG_WINDOW_SEC) {
+    logDeny(req, 'stale timestamp');
+    return res.status(401).send('stale timestamp');
+  }
+
+  try {
+    // GET/HEAD/OPTIONS 無 body，以空字串驗簽
+    const ok = verifyKey('', sig, String(ts), PUBLIC_KEY);
+    if (!ok) {
+      logDeny(req, 'invalid request signature');
       return res.status(401).send('invalid request signature');
     }
+  } catch (e) {
+    logDeny(req, 'invalid request signature');
+    return res.status(401).send('invalid request signature');
   }
   return res.status(200).end();
 }
@@ -468,7 +519,7 @@ function healthOrVerify(req, res) {
  * 互動處理
  * ========================= */
 export default async function handler(req, res) {
-  // 健康檢查 / 預檢：無簽章→200；若帶簽章→驗簽
+  // 嚴格健康檢查 / 預檢
   if (req.method === 'HEAD' || req.method === 'GET' || req.method === 'OPTIONS') {
     return healthOrVerify(req, res);
   }
@@ -476,18 +527,43 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   // 互動請求（POST）：必須帶簽章
+  if (!PUBLIC_KEY) {
+    logDeny(req, 'missing public key');
+    return res.status(500).send('server misconfigured: missing PUBLIC_KEY');
+  }
+
   const signature = req.headers['x-signature-ed25519'];
   const timestamp = req.headers['x-signature-timestamp'];
   if (!signature || !timestamp) {
+    logDeny(req, 'missing signature headers');
     return res.status(401).send('missing signature');
   }
+
+  if (STRICT_UA && !isLikelyDiscordUA(req)) {
+    logDeny(req, 'ua not allowed');
+    return res.status(401).send('ua not allowed');
+  }
+
+  // 時間窗檢查
+  const nowTs = Math.floor(Date.now() / 1000);
+  const tpost = parseInt(String(timestamp), 10);
+  if (!Number.isFinite(tpost) || Math.abs(nowTs - tpost) > SIG_WINDOW_SEC) {
+    logDeny(req, 'stale timestamp');
+    return res.status(401).send('stale timestamp');
+  }
+
   const rawBody = await readRawBody(req);
 
-  if (VERIFY_SIGNATURE) {
-    try {
-      const ok = verifyKey(rawBody, signature, timestamp, PUBLIC_KEY);
-      if (!ok) return res.status(401).send('invalid request signature');
-    } catch { return res.status(401).send('invalid request signature'); }
+  // 永遠驗簽（避免誤放）
+  try {
+    const ok = verifyKey(rawBody, signature, timestamp, PUBLIC_KEY);
+    if (!ok) {
+      logDeny(req, 'invalid request signature');
+      return res.status(401).send('invalid request signature');
+    }
+  } catch (e) {
+    logDeny(req, 'invalid request signature');
+    return res.status(401).send('invalid request signature');
   }
 
   const interaction = JSON.parse(rawBody);
@@ -499,14 +575,14 @@ export default async function handler(req, res) {
 
   // /cteam
   if (interaction.type === InteractionType.APPLICATION_COMMAND &&
-      interaction.data?.name === 'cteam') {
+      interaction.data && interaction.data.name === 'cteam') {
 
     const opts = interaction.data.options || [];
     const caps = parseCaps(opts);
     const multi = !!getOpt(opts, 'multi');
     const title = normalizeTitleInput(getOpt(opts, 'title') || '');
     let defaults = getOpt(opts, 'defaults') || '';
-    const ownerId = interaction.member?.user?.id || interaction.user?.id || '';
+    const ownerId = (interaction.member && interaction.member.user && interaction.member.user.id) || (interaction.user && interaction.user.id) || '';
 
     // defaults_file
     const defAtt = getAttachment(interaction, 'defaults_file');
@@ -544,13 +620,13 @@ export default async function handler(req, res) {
 
   // MESSAGE_COMPONENT
   if (interaction.type === InteractionType.MESSAGE_COMPONENT) {
-    const customId = interaction.data?.custom_id || '';
-    const userId = interaction.member?.user?.id || interaction.user?.id;
+    const customId = (interaction.data && interaction.data.custom_id) || '';
+    const userId = (interaction.member && interaction.member.user && interaction.member.user.id) || (interaction.user && interaction.user.id);
     const message = interaction.message;
-    const messageId = message?.id;
-    const channelId = message?.channel_id;
+    const messageId = message && message.id;
+    const channelId = message && message.channel_id;
 
-    const msgIdFromCid = customId.startsWith('admin_manage:')
+    const msgIdFromCid = customId.indexOf('admin_manage:') === 0
       ? customId.split(':').slice(-1)[0]
       : null;
     const targetMessageId = msgIdFromCid || messageId;
@@ -558,7 +634,7 @@ export default async function handler(req, res) {
     let baseState =
         await loadStateById(targetMessageId)
      || await kvGet(`boot:${interaction.token}`)
-     || fallbackStateFromContent(message?.content || '');
+     || fallbackStateFromContent((message && message.content) || '');
     baseState.messageId = targetMessageId;
 
     // 管理面板：開啟
@@ -566,7 +642,7 @@ export default async function handler(req, res) {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
+          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
       baseState.messageId = targetMessageId;
@@ -584,19 +660,19 @@ export default async function handler(req, res) {
       });
     }
 
-    if (customId.startsWith('admin_manage:pickmove')) {
+    if (customId.indexOf('admin_manage:pickmove') === 0) {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
+          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
-      const v = interaction.data.values?.[0] || '';
+      const v = (interaction.data.values && interaction.data.values[0]) || '';
       const m = v.match(/^pick:(\d+):(\d+)$/);
       if (!m) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '無效的選項。', flags: 64 }
+          data: { content: '無效的選項。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
       const fromIdx = parseInt(m[1], 10);
@@ -614,18 +690,18 @@ export default async function handler(req, res) {
     }
 
     // 管理面板：執行
-    if (customId.startsWith('admin_manage:kick:') || customId.startsWith('admin_manage:to:')) {
+    if (customId.indexOf('admin_manage:kick:') === 0 || customId.indexOf('admin_manage:to:') === 0) {
       if (!hasAdmin(interaction, baseState)) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64 }
+          data: { content: '只有開團者或伺服器管理員可以使用管理功能。', flags: 64, allowed_mentions: { parse: [] } }
         });
       }
 
       try {
         await withLock(`msg:${targetMessageId}`, 5, async () => {
-          if (customId.startsWith('admin_manage:kick:')) {
-            const v = interaction.data.values?.[0] || '';
+          if (customId.indexOf('admin_manage:kick:') === 0) {
+            const v = (interaction.data.values && interaction.data.values[0]) || '';
             const m = v.match(/^kick:(\d+):(\d+)$/);
             if (!m) throw new Error('無效的選項');
             const g = parseInt(m[1], 10);
@@ -648,7 +724,7 @@ export default async function handler(req, res) {
           const seg = customId.split(':');
           const moveId = seg[2];
           const fromIdx = parseInt(seg[3], 10);
-          const toIdx = parseInt(interaction.data.values?.[0] || '0', 10);
+          const toIdx = parseInt(((interaction.data.values && interaction.data.values[0]) || '0'), 10);
           if (!toIdx || toIdx === fromIdx) throw new Error('無效的目的團。');
           if (baseState.caps[toIdx - 1] <= 0) throw new Error(`第${numToHan(toIdx)}團名額已滿。`);
 
@@ -659,7 +735,7 @@ export default async function handler(req, res) {
           fromArr.splice(pos, 1);
           baseState.caps[fromIdx - 1] += 1;
           const toArr = baseState.members[String(toIdx)] || [];
-          if (!toArr.includes(moveId)) { toArr.push(moveId); baseState.caps[toIdx - 1] -= 1; }
+          if (toArr.indexOf(moveId) === -1) { toArr.push(moveId); baseState.caps[toIdx - 1] -= 1; }
 
           await saveStateById(targetMessageId, baseState);
           await patchOriginal(interaction, baseState, channelId);
@@ -671,7 +747,7 @@ export default async function handler(req, res) {
       } catch (e) {
         return res.status(200).json({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: `處理失敗：${String(e?.message || '未知錯誤')}`, flags: 64 }
+          data: { content: `處理失敗：${String((e && e.message) || '未知錯誤')}`, flags: 64, allowed_mentions: { parse: [] } }
         });
       }
       return;
@@ -693,18 +769,18 @@ export default async function handler(req, res) {
 
             await withLock(`msg:${targetMessageId}`, LOCK_TTL_SEC, async () => {
               const myGroups = Object.entries(state.members)
-                .filter(([, arr]) => Array.isArray(arr) && arr.includes(userId))
+                .filter(([, arr]) => Array.isArray(arr) && arr.indexOf(userId) !== -1)
                 .map(([k]) => parseInt(k, 10));
 
               if (action === 'join') {
-                if (!state.multi && myGroups.length > 0 && !myGroups.includes(idx)) {
+                if (!state.multi && myGroups.length > 0 && myGroups.indexOf(idx) === -1) {
                   throw new Error('EPH:你已加入其他團，未開啟「允許多團」。');
                 }
                 if (state.caps[idx - 1] <= 0) {
                   throw new Error(`EPH:第${numToHan(idx)}團名額已滿。`);
                 }
                 const arr = state.members[String(idx)];
-                if (!arr.includes(userId)) {
+                if (arr.indexOf(userId) === -1) {
                   arr.push(userId);
                   state.caps[idx - 1] -= 1;
                 } else {
@@ -735,15 +811,15 @@ export default async function handler(req, res) {
           sleep(FAST_TIMEOUT_MS).then(() => null),
         ]);
 
-        if (quick?.kind === 'update') {
+        if (quick && quick.kind === 'update') {
           return res.status(200).json({
             type: InteractionResponseType.UPDATE_MESSAGE,
             data: quick.data,
           });
         }
       } catch (e) {
-        const msg = String(e?.message || '');
-        if (msg.startsWith('EPH:')) {
+        const msg = String((e && e.message) || '');
+        if (msg.indexOf('EPH:') === 0) {
           return res.status(200).json({
             type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
             data: { content: msg.slice(4), flags: 64, allowed_mentions: { parse: [] } }
@@ -760,7 +836,7 @@ export default async function handler(req, res) {
         let state =
             await loadStateById(targetMessageId)
          || await kvGet(`boot:${interaction.token}`)
-         || fallbackStateFromContent(message?.content || '');
+         || fallbackStateFromContent((message && message.content) || '');
         state.messageId = targetMessageId;
 
         const m = customId.match(/^(join|leave)_(\d+)(?:__m([01]))?$/);
@@ -772,18 +848,18 @@ export default async function handler(req, res) {
 
         await withLock(`msg:${targetMessageId}`, 4, async () => {
           const myGroups = Object.entries(state.members)
-            .filter(([, arr]) => Array.isArray(arr) && arr.includes(userId))
+            .filter(([, arr]) => Array.isArray(arr) && arr.indexOf(userId) !== -1)
             .map(([k]) => parseInt(k, 10));
 
           if (action === 'join') {
-            if (!state.multi && myGroups.length > 0 && !myGroups.includes(idx)) {
+            if (!state.multi && myGroups.length > 0 && myGroups.indexOf(idx) === -1) {
               await followupEphemeral(interaction, '你已加入其他團，未開啟「允許多團」。'); return;
             }
             if (state.caps[idx - 1] <= 0) {
               await followupEphemeral(interaction, `第${numToHan(idx)}團名額已滿。`); return;
             }
             const arr = state.members[String(idx)];
-            if (!arr.includes(userId)) { arr.push(userId); state.caps[idx - 1] -= 1; }
+            if (arr.indexOf(userId) === -1) { arr.push(userId); state.caps[idx - 1] -= 1; }
             else { await followupEphemeral(interaction, `你已在第${numToHan(idx)}團。`); return; }
           } else {
             const arr = state.members[String(idx)];
@@ -808,7 +884,7 @@ export default async function handler(req, res) {
   // 其他互動
   return res.status(200).json({
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-    data: { content: '未處理的互動類型。', flags: 64 },
+    data: { content: '未處理的互動類型。', flags: 64, allowed_mentions: { parse: [] } },
   });
 }
 
@@ -832,7 +908,7 @@ async function patchOriginal(interaction, state, channelId) {
       }),
     });
     if (r.ok) return;
-    console.warn('webhook patch failed', r.status, await r.text());
+    try { console.warn('webhook patch failed', r.status, await r.text()); } catch (e) {}
   }
 
   // 後援：用 Bot Token 改頻道訊息（只要是自己機器人發的就能改）
@@ -851,9 +927,9 @@ async function patchOriginal(interaction, state, channelId) {
       }),
     });
     if (r2.ok) return;
-    console.error('bot patch failed', r2.status, await r2.text());
+    try { console.error('bot patch failed', r2.status, await r2.text()); } catch (e) {}
   } else {
-    console.error('bot patch skipped: missing BOT_TOKEN or channelId');
+    try { console.error('bot patch skipped: missing BOT_TOKEN or channelId'); } catch (e) {}
   }
 
   await followupEphemeral(interaction, '系統忙碌，請稍後再試（已收到你的操作）。');
@@ -869,18 +945,28 @@ async function followupEphemeral(interaction, text) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: text, flags: 64, allowed_mentions: { parse: [] } }),
     });
-  } catch (_) {}
+  } catch (e) {}
 }
 
 /* =========================
  * /cteam 參數
  * ========================= */
-function getOpt(opts, name) { return opts?.find(o => o.name === name)?.value; }
+function getOpt(opts, name) {
+  try {
+    const it = opts && opts.find(o => o.name === name);
+    return it ? it.value : undefined;
+  } catch (e) { return undefined; }
+}
 function parseCaps(opts) {
   const raw = getOpt(opts, 'caps');
-  if (!raw) return [12,12,12];
-  const arr = String(raw).split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n >= 0);
-  return arr.length ? arr : [12,12,12];
+  let arr = [];
+  if (raw) {
+    arr = String(raw).split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n >= 0);
+  }
+  if (!arr.length) arr = [12,12,12];
+  // 和 UI 一致，避免超過按鈕上限
+  if (arr.length > MAX_GROUPS) arr = arr.slice(0, MAX_GROUPS);
+  return arr;
 }
 
 /* =========================
@@ -909,10 +995,13 @@ function fallbackStateFromContent(content) {
   let groupIdx = 0;
   for (let i = start; i < lines.length; i++) {
     const s = lines[i].trim();
-    const m = s.match(/^第(.+?)團（-(\d+)）$/);
+    // 相容新舊格式：
+    // 新：第X團（剩 N）
+    // 舊：第X團（-N）
+    const m = s.match(/^第(.+?)團（(?:剩\s*)?(-?\d+)）$/);
     if (m) {
       groupIdx += 1;
-      caps.push(parseInt(m[2], 10));
+      caps.push(Math.max(0, parseInt(m[2], 10)));
       const next = (lines[i+1] || '').trim();
       const ids = Array.from(next.matchAll(/<@!?(\d+)>/g)).map(x => x[1]);
       members[String(groupIdx)] = ids;
@@ -920,7 +1009,7 @@ function fallbackStateFromContent(content) {
   }
   if (caps.length === 0) {
     caps.push(12,12,12);
-    members["1"] = []; members["2"] = []; members["3"] = [];
+    members['1'] = []; members['2'] = []; members['3'] = [];
   }
   return { title, caps, members, multi: false, messageId: null, ownerId: '', token: null };
 }
